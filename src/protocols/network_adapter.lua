@@ -1,5 +1,5 @@
 -- /protocols/network_adapter.lua
--- Network adapter that integrates with netd daemon when available
+-- Network adapter with UDP support that integrates with netd daemon
 -- Falls back to direct rednet/HTTP when netd is not running
 
 local NetworkAdapter = {}
@@ -19,6 +19,7 @@ NetworkAdapter.PROTOCOL_PORTS = {
     ws = 8080,
     wss = 8443,
     tcp = 8888,
+    udp = 0,        -- 0 = auto-assign
     mqtt = 1883,
     ssh = 22,
     ftp = 21,
@@ -36,6 +37,7 @@ function NetworkAdapter:new(networkType, options)
     obj.netdAvailable = fs.exists("/var/run/netd.pid")
     obj.netLib = nil
     obj.config = nil
+    obj.udpLib = nil
 
     -- Try to load network library if netd is running
     if obj.netdAvailable and fs.exists("/lib/network.lua") then
@@ -54,7 +56,8 @@ function NetworkAdapter:new(networkType, options)
                     fqdn = info.fqdn,
                     gateway = info.gateway,
                     dns = info.dns,
-                    modem_available = info.modem_available
+                    modem_available = info.modem_available,
+                    udp_enabled = info.udp_enabled
                 }
             end
         else
@@ -67,9 +70,18 @@ function NetworkAdapter:new(networkType, options)
         obj.config = obj:generateStandaloneConfig()
     end
 
+    -- Try to load UDP protocol if available
+    if fs.exists("/protocols/udp.lua") then
+        local success, udp = pcall(dofile, "/protocols/udp.lua")
+        if success then
+            obj.udpLib = udp
+        end
+    end
+
     -- Network state
     obj.connections = {}
     obj.servers = {}
+    obj.udpSockets = {}
     obj.packetId = 0
     obj.computerId = os.getComputerID()
 
@@ -93,18 +105,15 @@ function NetworkAdapter:generateStandaloneConfig()
             bit.band(bit.brshift(id, 8), 0xFF),
             bit.band(id, 0xFF))
 
-    -- Generate IP (10.0.X.X subnet)
+    -- Generate IP (10.0.x.x range)
     local ip = string.format("10.0.%d.%d",
             math.floor(id / 254) % 256,
             (id % 254) + 1)
 
     -- Generate hostname
     local hostname = label ~= "" and
-            string.format("%s-%d", label:lower():gsub("[^%w%-]", ""), id) or
-            string.format("cc-%d", id)
-
-    -- Check for modem
-    local modem_available = peripheral.find("modem") ~= nil
+            (label:lower():gsub("[^%w%-]", "") .. "-" .. id) or
+            ("cc-" .. id)
 
     return {
         ip = ip,
@@ -112,62 +121,59 @@ function NetworkAdapter:generateStandaloneConfig()
         hostname = hostname,
         fqdn = hostname .. ".local",
         gateway = "10.0.0.1",
-        dns = { primary = "10.0.0.1", secondary = "8.8.8.8" },
-        modem_available = modem_available
+        dns = {"10.0.0.1", "8.8.8.8"},
+        modem_available = peripheral.find("modem") ~= nil,
+        udp_enabled = self.udpLib ~= nil
     }
 end
 
--- Initialize standalone mode (when netd is not running)
+-- Initialize standalone mode
 function NetworkAdapter:initializeStandalone()
-    -- Open rednet if needed and modem available
-    if self.config.modem_available and not rednet.isOpen() then
-        local modem = peripheral.find("modem")
-        if modem then
-            rednet.open(peripheral.getName(modem))
+    -- Open modem if available
+    local modem = peripheral.find("modem")
+    if modem then
+        local side = peripheral.getName(modem)
+        if not rednet.isOpen(side) then
+            rednet.open(side)
         end
     end
 
-    -- Register hostname if modem available
-    if self.config.modem_available then
-        rednet.host("network_adapter", self.config.hostname)
+    -- Initialize UDP if available
+    if self.udpLib then
+        self.udpLib.start()
     end
 end
 
--- Determine if URL is local or remote
-function NetworkAdapter:isLocalURL(url)
-    -- Check for local indicators
-    if url:find("%.local") or
-            url:find("^localhost") or
-            url:find("^127%.") or
-            url:find("^10%.0%.") or
-            url:find("^192%.168%.") or
-            url:find("^172%.") or
-            url:find("^cc%-") or
-            url:find("^computer%-") then
-        return true
-    end
-    return false
-end
-
--- Parse URL
+-- Parse URL to determine if local or remote
 function NetworkAdapter:parseURL(url)
-    local protocol, host, port, path = url:match("^(%w+)://([^:/]+):?(%d*)(/?.*)$")
+    local protocol, host, port, path
 
-    if not protocol then
-        -- Try without protocol
+    -- Parse protocol://host:port/path
+    protocol = url:match("^(%w+)://")
+    if protocol then
+        host, port, path = url:match("^%w+://([^:/]+):?(%d*)(/?.*)$")
+    else
         host, port, path = url:match("^([^:/]+):?(%d*)(/?.*)$")
-        protocol = "http"
     end
 
-    port = tonumber(port) or NetworkAdapter.PROTOCOL_PORTS[protocol] or 80
+    -- Default ports based on protocol
+    if not port or port == "" then
+        port = NetworkAdapter.PROTOCOL_PORTS[protocol] or 80
+    else
+        port = tonumber(port)
+    end
+
     path = path ~= "" and path or "/"
 
-    -- Determine if local
-    local isLocal = self:isLocalURL(host)
-
-    -- Auto-detect network type
-    if self.networkType == NetworkAdapter.NETWORK_TYPES.AUTO then
-        self.networkType = isLocal and NetworkAdapter.NETWORK_TYPES.LOCAL or NetworkAdapter.NETWORK_TYPES.REMOTE
+    -- Determine if local or remote
+    local isLocal = false
+    if host == "localhost" or
+            host == self.config.hostname or
+            host == self.config.fqdn or
+            host:match("^10%.") or
+            host:match("^192%.168%.") or
+            host:match("^172%.(%d+)%.") then
+        isLocal = true
     end
 
     return {
@@ -175,61 +181,87 @@ function NetworkAdapter:parseURL(url)
         host = host,
         port = port,
         path = path,
-        isLocal = isLocal,
-        url = url
+        isLocal = isLocal
     }
 end
 
--- HTTP GET implementation
-function NetworkAdapter:httpGet(url, headers)
-    local parsed = self:parseURL(url)
-
-    -- Use netd if available and URL is local
-    if self.useNetd and parsed.isLocal and self.netLib then
-        return self.netLib.http(url, {
-            method = "GET",
-            headers = headers
-        })
-    elseif parsed.isLocal and self.networkType ~= NetworkAdapter.NETWORK_TYPES.REMOTE then
-        -- Use standalone local implementation
-        return self:localHttpRequest({
-            method = "GET",
-            url = parsed,
-            headers = headers
-        })
+-- UDP implementation
+function NetworkAdapter:udp()
+    if self.useNetd and self.netLib and self.netLib.udpSocket then
+        -- Use netd's UDP implementation
+        return self.netLib
+    elseif self.udpLib then
+        -- Use standalone UDP
+        return self.udpLib
     else
-        -- Use native HTTP for remote
-        return self:remoteHttpGet(url, headers)
+        error("UDP protocol not available")
     end
 end
 
--- HTTP POST implementation
-function NetworkAdapter:httpPost(url, data, headers)
-    local parsed = self:parseURL(url)
-
-    -- Use netd if available and URL is local
-    if self.useNetd and parsed.isLocal and self.netLib then
-        return self.netLib.http(url, {
-            method = "POST",
-            headers = headers,
-            body = data
-        })
-    elseif parsed.isLocal and self.networkType ~= NetworkAdapter.NETWORK_TYPES.REMOTE then
-        -- Use standalone local implementation
-        return self:localHttpRequest({
-            method = "POST",
-            url = parsed,
-            headers = headers,
-            body = data
-        })
+-- Create UDP socket
+function NetworkAdapter:udpSocket(port, options)
+    if self.useNetd and self.netLib and self.netLib.udpSocket then
+        return self.netLib.udpSocket(port, options)
+    elseif self.udpLib then
+        local socket = self.udpLib.socket(port, options)
+        self.udpSockets[socket.port] = socket
+        return socket
     else
-        -- Use native HTTP for remote
-        return self:remoteHttpPost(url, data, headers)
+        return nil, "UDP not available"
     end
 end
 
--- Generic HTTP request
-function NetworkAdapter:httpRequest(options)
+-- Send UDP datagram
+function NetworkAdapter:udpSend(destIP, destPort, data, sourcePort)
+    if self.useNetd and self.netLib and self.netLib.udpSend then
+        return self.netLib.udpSend(destIP, destPort, data, sourcePort)
+    elseif self.udpLib then
+        local socket = sourcePort and self.udpSockets[sourcePort]
+        if not socket then
+            socket = self.udpLib.socket(sourcePort)
+            if sourcePort then
+                socket:bind(sourcePort)
+            end
+        end
+
+        local success, err = socket:send(data, destIP, destPort)
+
+        -- Clean up temporary socket
+        if not sourcePort or not self.udpSockets[sourcePort] then
+            socket:close()
+        end
+
+        return success, err
+    else
+        return nil, "UDP not available"
+    end
+end
+
+-- Listen for UDP datagrams
+function NetworkAdapter:udpListen(port, callback)
+    if self.useNetd and self.netLib and self.netLib.udpListen then
+        return self.netLib.udpListen(port, callback)
+    elseif self.udpLib then
+        local socket = self.udpLib.socket(port)
+        socket:bind(port)
+
+        if callback then
+            socket:setReceiveCallback(callback)
+        end
+
+        self.udpSockets[port] = socket
+        return socket
+    else
+        return nil, "UDP not available"
+    end
+end
+
+-- HTTP implementation (existing)
+function NetworkAdapter:http(options)
+    if type(options) == "string" then
+        options = {url = options}
+    end
+
     local parsed = self:parseURL(options.url)
 
     -- Use netd if available and URL is local
@@ -243,7 +275,7 @@ function NetworkAdapter:httpRequest(options)
     end
 end
 
--- WebSocket implementation
+-- WebSocket implementation (existing)
 function NetworkAdapter:websocket(url)
     local parsed = self:parseURL(url)
 
@@ -254,6 +286,33 @@ function NetworkAdapter:websocket(url)
         return self:localWebsocket(parsed)
     else
         return self:remoteWebsocket(url)
+    end
+end
+
+-- TCP implementation
+function NetworkAdapter:tcp(host, port, options)
+    -- Check if we have TCP protocol available
+    local tcpLib = nil
+    if fs.exists("/protocols/tcp.lua") then
+        tcpLib = dofile("/protocols/tcp.lua")
+    end
+
+    if not tcpLib then
+        return nil, "TCP protocol not available"
+    end
+
+    -- Determine if local or remote
+    local isLocal = host == "localhost" or
+            host == self.config.hostname or
+            host:match("^10%.") or
+            host:match("^192%.168%.")
+
+    if isLocal and self.config.modem_available then
+        -- Local TCP over rednet
+        return tcpLib:new(host, port, options)
+    else
+        -- TCP over external network would need special handling
+        return nil, "External TCP connections not supported"
     end
 end
 
@@ -310,10 +369,14 @@ function NetworkAdapter:localHttpRequest(options)
         local event, param1, param2, param3 = os.pullEvent()
 
         if event == "rednet_message" and param3 == "network_adapter_http" then
-            local sender, response = param1, param2
-            if response.type == "http_response" and response.id == packet.id then
+            local sender, message = param1, param2
+            if type(message) == "table" and message.id == packet.id then
                 os.cancelTimer(timeout)
-                return self:createHttpResponse(response)
+                return {
+                    getResponseCode = function() return message.code or 200 end,
+                    readAll = function() return message.body or "" end,
+                    close = function() end
+                }
             end
         elseif event == "timer" and param1 == timeout then
             return nil, "Request timeout"
@@ -321,293 +384,195 @@ function NetworkAdapter:localHttpRequest(options)
     end
 end
 
--- Standalone WebSocket (when netd is not running)
-function NetworkAdapter:localWebsocket(url)
-    if not self.config.modem_available then
-        return nil, "No modem available for local network"
+-- Remote HTTP request (external)
+function NetworkAdapter:remoteHttpRequest(options)
+    local url = type(options) == "string" and options or options.url
+    local method = type(options) == "table" and options.method or "GET"
+    local headers = type(options) == "table" and options.headers or {}
+    local body = type(options) == "table" and options.body
+
+    if method == "POST" then
+        return http.post(url, body, headers)
+    else
+        return http.get(url, headers)
     end
-
-    -- Ensure modem is open
-    if not rednet.isOpen() then
-        local modem = peripheral.find("modem")
-        if modem then
-            rednet.open(peripheral.getName(modem))
-        else
-            return nil, "No modem found"
-        end
-    end
-
-    local destId = self:resolveHostnameStandalone(url.host)
-    if not destId then
-        return nil, "Host not found"
-    end
-
-    -- Create WebSocket connection object
-    local ws = {
-        url = url,
-        destId = destId,
-        connected = false,
-        adapter = self,
-        connectionId = os.epoch("utc") .. "_" .. math.random(1000, 9999)
-    }
-
-    -- WebSocket methods
-    function ws:connect()
-        -- Send connect packet
-        rednet.send(self.destId, {
-            type = "ws_connect",
-            connectionId = self.connectionId,
-            url = self.url
-        }, "network_adapter_ws")
-
-        -- Wait for acceptance
-        local timeout = os.startTimer(5)
-        while true do
-            local event, param1, param2, param3 = os.pullEvent()
-            if event == "rednet_message" and param3 == "network_adapter_ws" then
-                local sender, msg = param1, param2
-                if msg.type == "ws_accept" and msg.connectionId == self.connectionId then
-                    os.cancelTimer(timeout)
-                    self.connected = true
-                    return true
-                end
-            elseif event == "timer" and param1 == timeout then
-                return false, "Connection timeout"
-            end
-        end
-    end
-
-    function ws:send(data)
-        if not self.connected then
-            return false, "Not connected"
-        end
-
-        rednet.send(self.destId, {
-            type = "ws_data",
-            connectionId = self.connectionId,
-            data = data
-        }, "network_adapter_ws")
-        return true
-    end
-
-    function ws:receive(timeout)
-        local timer = timeout and os.startTimer(timeout)
-        while true do
-            local event, param1, param2, param3 = os.pullEvent()
-            if event == "rednet_message" and param3 == "network_adapter_ws" then
-                local sender, msg = param1, param2
-                if msg.type == "ws_data" and msg.connectionId == self.connectionId then
-                    if timer then os.cancelTimer(timer) end
-                    return msg.data
-                end
-            elseif event == "timer" and timer and param1 == timer then
-                return nil
-            end
-        end
-    end
-
-    function ws:close()
-        if self.connected then
-            rednet.send(self.destId, {
-                type = "ws_close",
-                connectionId = self.connectionId
-            }, "network_adapter_ws")
-            self.connected = false
-        end
-    end
-
-    -- Auto-connect
-    ws:connect()
-
-    return ws
 end
 
--- Resolve hostname in standalone mode
-function NetworkAdapter:resolveHostnameStandalone(hostname)
-    -- Check for localhost
-    if hostname == "localhost" or hostname == "127.0.0.1" then
-        return self.computerId
+-- Standalone WebSocket
+function NetworkAdapter:localWebsocket(parsed)
+    if not self.config.modem_available then
+        return nil, "No modem available"
     end
 
-    -- Check for IP address format
-    if hostname:match("^%d+%.%d+%.%d+%.%d+$") then
-        -- Try to find computer with this IP
-        rednet.broadcast({
-            type = "ip_query",
-            ip = hostname
-        }, "network_adapter_discovery")
+    -- Implementation similar to network.lua's WebSocket
+    local connectionId = "ws_" .. os.epoch("utc") .. "_" .. math.random(1000)
 
-        local timeout = os.startTimer(2)
-        while true do
-            local event, param1, param2, param3 = os.pullEvent()
-            if event == "rednet_message" and param3 == "network_adapter_discovery" then
-                local sender, msg = param1, param2
-                if msg.type == "ip_response" and msg.ip == hostname then
+    -- Send connection request
+    rednet.broadcast({
+        type = "ws_connect",
+        connectionId = connectionId,
+        url = parsed
+    }, "network_adapter_ws")
+
+    -- Wait for response
+    local timeout = os.startTimer(5)
+    while true do
+        local event, param1, param2, param3 = os.pullEvent()
+
+        if event == "rednet_message" and param3 == "network_adapter_ws" then
+            local sender, message = param1, param2
+            if type(message) == "table" and message.connectionId == connectionId then
+                if message.type == "accept" then
                     os.cancelTimer(timeout)
-                    return sender
+                    -- Return WebSocket object
+                    return self:createWebSocketObject(connectionId, sender)
+                elseif message.type == "reject" then
+                    os.cancelTimer(timeout)
+                    return nil, message.reason or "Connection rejected"
                 end
-            elseif event == "timer" and param1 == timeout then
-                break
             end
+        elseif event == "timer" and param1 == timeout then
+            return nil, "Connection timeout"
         end
     end
+end
 
-    -- Try hostname resolution
+-- Remote WebSocket
+function NetworkAdapter:remoteWebsocket(url)
+    return http.websocket(url)
+end
+
+-- Create WebSocket object
+function NetworkAdapter:createWebSocketObject(connectionId, peerId)
+    return {
+        send = function(data)
+            rednet.send(peerId, {
+                type = "ws_data",
+                connectionId = connectionId,
+                data = data
+            }, "network_adapter_ws")
+        end,
+
+        receive = function(timeout)
+            local timer = nil
+            if timeout then timer = os.startTimer(timeout) end
+
+            while true do
+                local event, param1, param2, param3 = os.pullEvent()
+                if event == "rednet_message" and param3 == "network_adapter_ws" then
+                    local sender, message = param1, param2
+                    if sender == peerId and type(message) == "table" and
+                            message.connectionId == connectionId and message.type == "ws_data" then
+                        if timer then os.cancelTimer(timer) end
+                        return message.data
+                    end
+                elseif event == "timer" and timer and param1 == timer then
+                    return nil, "Timeout"
+                end
+            end
+        end,
+
+        close = function()
+            rednet.send(peerId, {
+                type = "ws_close",
+                connectionId = connectionId
+            }, "network_adapter_ws")
+        end
+    }
+end
+
+-- Hostname resolution helper
+function NetworkAdapter:resolveHostnameStandalone(hostname)
+    -- Check if it's already a computer ID
+    local id = tonumber(hostname)
+    if id then return id end
+
+    -- Try rednet lookup
+    local id = rednet.lookup("network_adapter_discovery", hostname)
+    if id then return id end
+
+    -- Broadcast query
     rednet.broadcast({
         type = "hostname_query",
         hostname = hostname
     }, "network_adapter_discovery")
 
+    -- Wait for response
     local timeout = os.startTimer(2)
     while true do
         local event, param1, param2, param3 = os.pullEvent()
+
         if event == "rednet_message" and param3 == "network_adapter_discovery" then
-            local sender, msg = param1, param2
-            if msg.type == "hostname_response" and
-                    (msg.hostname == hostname or msg.hostname == hostname:gsub("%.local$", "")) then
+            local sender, message = param1, param2
+            if type(message) == "table" and message.type == "hostname_response" and
+                    message.hostname == hostname then
                 os.cancelTimer(timeout)
                 return sender
             end
         elseif event == "timer" and param1 == timeout then
-            break
+            return nil
         end
     end
-
-    return nil
 end
 
--- Create HTTP response object
-function NetworkAdapter:createHttpResponse(packet)
-    local response = {
-        data = packet.body or "",
-        code = packet.code or 200,
-        headers = packet.headers or {},
-
-        readAll = function()
-            return packet.body or ""
-        end,
-
-        getResponseCode = function()
-            return packet.code or 200
-        end,
-
-        getResponseHeaders = function()
-            return packet.headers or {}
-        end,
-
-        close = function()
-            -- Cleanup
-        end
+-- Get network statistics
+function NetworkAdapter:getStatistics()
+    local stats = {
+        connections = 0,
+        servers = 0,
+        udp_sockets = 0,
+        packets_sent = self.packetId,
+        netd_running = self.netdAvailable,
+        udp_enabled = self.udpLib ~= nil or (self.config and self.config.udp_enabled)
     }
 
-    return response
-end
-
--- Remote implementations (standard HTTP/WebSocket)
-function NetworkAdapter:remoteHttpGet(url, headers)
-    local c_http = http or _G.http
-    if c_http then
-        return c_http.get(url, headers)
-    else
-        return nil, "HTTP API not available"
+    for _ in pairs(self.connections) do
+        stats.connections = stats.connections + 1
     end
-end
 
-function NetworkAdapter:remoteHttpPost(url, data, headers)
-    local c_http = http or _G.http
-    if c_http then
-        return c_http.post(url, data, headers)
-    else
-        return nil, "HTTP API not available"
+    for _ in pairs(self.servers) do
+        stats.servers = stats.servers + 1
     end
-end
 
-function NetworkAdapter:remoteHttpRequest(options)
-    local c_http = http or _G.http
-    if c_http then
-        return c_http.request(options)
-    else
-        return nil, "HTTP API not available"
+    for _ in pairs(self.udpSockets) do
+        stats.udp_sockets = stats.udp_sockets + 1
     end
-end
 
-function NetworkAdapter:remoteWebsocket(url)
-    local c_http = http or _G.http
-    if c_http and c_http.websocket then
-        return c_http.websocket(url)
-    else
-        return nil, "WebSocket API not available"
+    -- Get UDP statistics if available
+    if self.udpLib and self.udpLib.getStatistics then
+        stats.udp = self.udpLib.getStatistics()
+    elseif self.netLib and self.netLib.getUDPStats then
+        stats.udp = self.netLib.getUDPStats()
     end
+
+    return stats
 end
 
--- Check if netd is available
-function NetworkAdapter:isNetdRunning()
-    return self.useNetd
-end
-
--- Get network info
-function NetworkAdapter:getNetworkInfo()
-    if self.useNetd and self.netLib and self.netLib.getInfo then
-        return self.netLib.getInfo()
-    else
-        return self.config
-    end
-end
-
--- Create server (local network only)
-function NetworkAdapter:createServer(port, handler)
-    if self.useNetd and self.netLib and self.netLib.createServer then
-        return self.netLib.createServer(port, handler)
-    elseif self.config.modem_available then
-        -- Standalone server implementation
-        if not rednet.isOpen() then
-            local modem = peripheral.find("modem")
-            if modem then
-                rednet.open(peripheral.getName(modem))
-            else
-                return nil, "No modem available"
-            end
+-- Cleanup
+function NetworkAdapter:cleanup()
+    -- Close all UDP sockets
+    for port, socket in pairs(self.udpSockets) do
+        if socket.close then
+            socket:close()
         end
-
-        -- Start server loop
-        parallel.waitForAny(function()
-            while true do
-                local sender, message, protocol = rednet.receive()
-
-                if protocol == "network_adapter_http" then
-                    if type(message) == "table" and
-                            message.type == "http_request" and
-                            message.port == port then
-
-                        -- Handle request
-                        local response = handler({
-                            method = message.method,
-                            path = message.path,
-                            headers = message.headers,
-                            body = message.body,
-                            source = message.source
-                        })
-
-                        -- Send response
-                        local responsePacket = {
-                            type = "http_response",
-                            id = message.id,
-                            code = response.code or 200,
-                            headers = response.headers or {},
-                            body = response.body or "",
-                            timestamp = os.epoch("utc")
-                        }
-
-                        rednet.send(sender, responsePacket, "network_adapter_http")
-                    end
-                end
-            end
-        end)
-
-        return true
-    else
-        return nil, "No network available for server"
     end
+    self.udpSockets = {}
+
+    -- Close all connections
+    for id, conn in pairs(self.connections) do
+        if conn.close then
+            conn:close()
+        end
+    end
+    self.connections = {}
+
+    -- Stop all servers
+    for id, server in pairs(self.servers) do
+        if server.stop then
+            server:stop()
+        end
+    end
+    self.servers = {}
 end
 
 return NetworkAdapter

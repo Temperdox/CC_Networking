@@ -1,9 +1,9 @@
--- /bin/netd.lua (quiet console + buffered file logging)
+-- /bin/netd.lua (with UDP support)
 -- Network daemon for ComputerCraft
--- Updated with global stop signal support
+-- Updated with UDP protocol capabilities
 
-local version, daemon_name = "1.0.1", "netd"
-print("[netd] Starting Network Daemon v" .. version)
+local version, daemon_name = "1.1.0", "netd"
+print("[netd] Starting Network Daemon v" .. version .. " (UDP enabled)")
 
 -- already running?
 if fs.exists("/var/run/netd.pid") then
@@ -21,6 +21,13 @@ if fs.exists("/var/run/netd.stop") then
     return
 end
 
+-- Load UDP protocol if available
+local udp = nil
+if fs.exists("/protocols/udp.lua") then
+    udp = dofile("/protocols/udp.lua")
+    print("[netd] UDP protocol loaded")
+end
+
 -- load config
 local function loadConfig()
     local paths={"/config/network.cfg","/etc/network.cfg"}
@@ -30,7 +37,13 @@ local function loadConfig()
             local fh=fs.open(p,"r"); if not fh then print("[netd] ERROR: Cannot read: "..p) goto continue end
             local content=fh.readAll(); fh.close()
             local fn,err=loadstring(content); if not fn then print("[netd] ERROR: parse: "..tostring(err)) goto continue end
-            local ok,res=pcall(fn); if ok and res then print("[netd] Configuration loaded successfully"); return res
+            local ok,res=pcall(fn); if ok and res then
+            print("[netd] Configuration loaded successfully")
+            -- Add UDP protocol configuration
+            res.udp_proto = res.udp_proto or "ccnet_udp"
+            res.services = res.services or {}
+            res.services.udp = res.services.udp or { enabled = true, port = 0 }
+            return res
         else print("[netd] ERROR: exec: "..tostring(res)) end
         end
         ::continue::
@@ -106,40 +119,63 @@ end
 
 logger:init()
 
--- persistent state
-local state_file = "/var/cache/netd.state"
-local network_state = {}
+-- ----------------- network state ----------------
+local network_state = {
+    running = true,
+    start_time = os.epoch("utc"),
+    dns_cache = {},
+    arp_cache = {},
+    connections = {},
+    servers = {},
+    udp_sockets = {},  -- Track UDP sockets
+    stats = {
+        packets_sent = 0,
+        packets_received = 0,
+        bytes_sent = 0,
+        bytes_received = 0,
+        dns_queries = 0,
+        arp_requests = 0,
+        http_requests = 0,
+        websocket_connections = 0,
+        udp_packets = 0,  -- Add UDP statistics
+        uptime = 0
+    }
+}
 
+-- ----------------- Existing helper functions ----------------
 local function loadState()
-    if fs.exists(state_file) then
-        local f=fs.open(state_file,"r"); if f then local data=f.readAll(); f.close()
-        local t=textutils.unserialize(data); if t then network_state=t; logger:debug("Loaded network state from cache") end
+    if not fs.exists("/var/cache/netd.state") then return end
+    local f = fs.open("/var/cache/netd.state","r"); if not f then return end
+    local s = textutils.unserialize(f.readAll()); f.close()
+    if s then
+        network_state.dns_cache = s.dns_cache or {}
+        network_state.arp_cache = s.arp_cache or {}
+        network_state.servers = s.servers or {}
+        network_state.udp_sockets = s.udp_sockets or {}
+        logger:debug("Loaded network state from cache")
     end
-    end
-    network_state.running=true
-    network_state.start_time=network_state.start_time or os.epoch("utc")
-    network_state.dns_cache=network_state.dns_cache or {}
-    network_state.arp_cache=network_state.arp_cache or {}
-    network_state.route_cache=network_state.route_cache or {}
-    network_state.connections=network_state.connections or {}
-    network_state.servers=network_state.servers or {}
-    network_state.stats=network_state.stats or { packets_sent=0, packets_received=0, bytes_sent=0, bytes_received=0, errors=0, uptime=0, dns_queries=0, arp_requests=0, http_requests=0, websocket_connections=0 }
 end
 
 local function saveState()
-    local f=fs.open(state_file,"w"); if f then
-        local to_save = { dns_cache=network_state.dns_cache, arp_cache=network_state.arp_cache, stats=network_state.stats, start_time=network_state.start_time }
-        f.write(textutils.serialize(to_save)); f.close()
+    local f = fs.open("/var/cache/netd.state","w"); if f then
+        f.write(textutils.serialize({
+            dns_cache = network_state.dns_cache,
+            arp_cache = network_state.arp_cache,
+            servers = network_state.servers,
+            udp_sockets = network_state.udp_sockets,
+            saved_at = os.epoch("utc")
+        }))
+        f.close()
     end
 end
 
 local function openModem()
-    if rednet.isOpen() then logger:debug("Rednet already open"); return true end
-    if cfg.modem_side == "auto" then
-        local m=peripheral.find("modem"); if m then local side=peripheral.getName(m); rednet.open(side); logger:info("Modem opened on side: %s", side); return true end
-    else
-        if peripheral.isPresent(cfg.modem_side) and peripheral.getType(cfg.modem_side)=="modem" then
-            rednet.open(cfg.modem_side); logger:info("Modem opened on side: %s", cfg.modem_side); return true
+    if cfg.modem_side and peripheral.isPresent(cfg.modem_side) then
+        rednet.open(cfg.modem_side); logger:info("Modem opened on configured side: %s", cfg.modem_side); return true
+    end
+    local sides={"back","top","bottom","left","right","front"}; for _,s in ipairs(sides) do
+        if peripheral.isPresent(s) and peripheral.getType(s)=="modem" then
+            rednet.open(s); cfg.modem_side = s; logger:info("Modem opened on side: %s", cfg.modem_side); return true
         end
     end
     logger:warn("No modem found - network features disabled"); return false
@@ -159,8 +195,23 @@ local function initNetwork()
     local pid = fs.open("/var/run/netd.pid","w"); if pid then pid.write(tostring(cfg.id)); pid.close(); logger:info("Created PID file") end
 
     local info = fs.open("/var/run/network.info","w"); if info then
-        info.write(textutils.serialize({ ip=cfg.ipv4, mac=cfg.mac, hostname=cfg.hostname, fqdn=cfg.fqdn, gateway=cfg.gateway, dns=cfg.dns, modem_available=modem }))
+        info.write(textutils.serialize({
+            ip=cfg.ipv4,
+            mac=cfg.mac,
+            hostname=cfg.hostname,
+            fqdn=cfg.fqdn,
+            gateway=cfg.gateway,
+            dns=cfg.dns,
+            modem_available=modem,
+            udp_enabled = udp ~= nil
+        }))
         info.close(); logger:debug("Created network info file")
+    end
+
+    -- Initialize UDP if available
+    if udp then
+        udp.start()
+        logger:info("UDP protocol initialized")
     end
 
     if modem then broadcastPresence() end
@@ -169,17 +220,53 @@ end
 
 function broadcastPresence()
     if not rednet.isOpen() then return end
-    local ann={ type="announce", id=cfg.id, hostname=cfg.hostname, mac=cfg.mac, ip=cfg.ipv4, services={}, timestamp=os.epoch("utc") }
+    local ann={
+        type="announce",
+        id=cfg.id,
+        hostname=cfg.hostname,
+        mac=cfg.mac,
+        ip=cfg.ipv4,
+        services={},
+        timestamp=os.epoch("utc"),
+        protocols={
+            udp = udp ~= nil
+        }
+    }
     if cfg.services then for s,c in pairs(cfg.services) do if c.enabled then ann.services[s]=c.port end end end
     rednet.broadcast(ann, cfg.discovery_proto)
-    logger:debug("Broadcast network presence"); network_state.stats.packets_sent = network_state.stats.packets_sent + 1
+    logger:debug("Broadcast network presence (UDP: %s)", tostring(udp ~= nil))
+    network_state.stats.packets_sent = network_state.stats.packets_sent + 1
 end
 
+-- ----------------- UDP Handler ----------------
+local function handleUDP(sender, message)
+    if not udp then
+        logger:warn("Received UDP packet but UDP protocol not loaded")
+        return
+    end
+
+    if type(message) ~= "table" then return end
+
+    network_state.stats.udp_packets = network_state.stats.udp_packets + 1
+
+    -- Pass to UDP protocol handler
+    local handled = udp.handleIncomingPacket(message)
+
+    if handled then
+        logger:trace("UDP packet handled from %d", sender)
+        network_state.stats.packets_received = network_state.stats.packets_received + 1
+        network_state.stats.bytes_received = network_state.stats.bytes_received + #textutils.serialize(message)
+    else
+        logger:debug("UDP packet not handled - port %d unreachable", message.udp_packet and message.udp_packet.dest_port or 0)
+    end
+end
+
+-- ----------------- Existing handlers (discovery, DNS, ARP, HTTP, WS) ----------------
 local function handleDiscovery(sender,message)
     if message=="whoami?" then
         rednet.send(sender,{id=cfg.id,hostname=cfg.hostname,mac=cfg.mac,ip=cfg.ipv4}, cfg.proto); logger:trace("Sent identity to computer %d", sender)
     elseif type(message)=="table" and message.type=="query" then
-        local resp={ type="response", id=cfg.id, hostname=cfg.hostname, fqdn=cfg.fqdn, mac=cfg.mac, ip=cfg.ipv4, services={}, routes=cfg.routes, timestamp=os.epoch("utc") }
+        local resp={ type="response", id=cfg.id, hostname=cfg.hostname, fqdn=cfg.fqdn, mac=cfg.mac, ip=cfg.ipv4, services={}, routes=cfg.routes, timestamp=os.epoch("utc"), protocols={udp=udp~=nil} }
         if cfg.services then for s,c in pairs(cfg.services) do if c.enabled then resp.services[s]=c.port end end end
         rednet.send(sender, resp, cfg.discovery_proto); logger:trace("Sent detailed info to computer %d", sender)
     elseif type(message)=="table" and message.type=="announce" then
@@ -203,11 +290,12 @@ local function handleDNS(sender,message)
         end
         local cached = network_state.dns_cache[message.hostname]
         if cached and cached.expires > os.epoch("utc") then
-            local resp={ type="response", hostname=message.hostname, ip=cached.ip, ttl=math.floor((cached.expires-os.epoch("utc"))/1000) }
-            rednet.send(sender, resp, cfg.dns_proto); logger:debug("Answered DNS query from cache: %s -> %s", message.hostname, cached.ip)
+            rednet.send(sender, {type="response", hostname=message.hostname, ip=cached.ip, ttl=cached.ttl}, cfg.dns_proto)
+            logger:trace("Sent cached DNS response for %s", message.hostname)
         end
     elseif message.type=="response" and message.hostname and message.ip then
-        network_state.dns_cache[message.hostname]={ ip=message.ip, expires=os.epoch("utc")+((message.ttl or 300)*1000) }; logger:trace("Cached DNS entry: %s -> %s", message.hostname, message.ip)
+        network_state.dns_cache[message.hostname] = { ip=message.ip, ttl=message.ttl or 300, expires=os.epoch("utc") + ((message.ttl or 300)*1000) }
+        logger:debug("Cached DNS response: %s -> %s", message.hostname, message.ip)
     end
     network_state.stats.packets_received = network_state.stats.packets_received + 1
 end
@@ -215,24 +303,26 @@ end
 local function handleARP(sender,message)
     if type(message) ~= "table" then return end
     network_state.stats.arp_requests = network_state.stats.arp_requests + 1
-    if message.type=="request" and message.ip==cfg.ipv4 then
-        rednet.send(sender,{type="reply", ip=cfg.ipv4, mac=cfg.mac, hostname=cfg.hostname}, cfg.arp_proto); logger:debug("Answered ARP request from %d", sender)
+    if message.type=="request" and message.target_ip==cfg.ipv4 then
+        rednet.send(sender,{type="reply", ip=cfg.ipv4, mac=cfg.mac}, cfg.arp_proto)
+        logger:trace("Sent ARP reply to %d", sender)
     elseif message.type=="reply" and message.ip and message.mac then
-        network_state.arp_cache[message.ip]={ mac=message.mac, hostname=message.hostname, computer_id=sender, expires=os.epoch("utc")+((cfg.cache and cfg.cache.arp_ttl or 600)*1000) }
-        logger:trace("Cached ARP entry: %s -> %s (%d)", message.ip, message.mac, sender)
+        network_state.arp_cache[message.ip] = { mac=message.mac, computer_id=sender, expires=os.epoch("utc") + (cfg.cache and cfg.cache.arp_ttl*1000 or 600000) }
+        logger:debug("Cached ARP: %s -> %s", message.ip, message.mac)
     end
     network_state.stats.packets_received = network_state.stats.packets_received + 1
 end
 
 local function handleHTTP(sender,message)
     if type(message) ~= "table" then return end
+    network_state.stats.http_requests = network_state.stats.http_requests + 1
     if message.type=="request" or message.type=="http_request" then
-        network_state.stats.http_requests = network_state.stats.http_requests + 1
-        local server = network_state.servers[message.port]; local response
+        logger:debug("HTTP request from %d: %s %s", sender, message.method or "GET", message.path or "/")
+        local response
+        local server = network_state.servers[message.port or 80]
         if server and server.handler then
-            logger:debug("HTTP %s %s", message.method, message.path)
-            local ok, res = pcall(server.handler, message)
-            if ok then response=res else logger:error("HTTP handler error: %s", res); response={code=500, body="Internal Server Error", headers={}} end
+            local req={ method=message.method or "GET", path=message.path or "/", headers=message.headers or {}, body=message.body, source=sender }
+            local ok,res = pcall(server.handler, req); if ok then response=res else logger:error("HTTP handler error: %s", res); response={code=500, body="Internal Server Error", headers={}} end
         else
             response={code=404, body="Not Found", headers={}}
         end
@@ -275,7 +365,8 @@ local function handleNetworkAdapter(sender,message,protocol)
             rednet.send(sender,{type="ip_response", ip=cfg.ipv4, hostname=cfg.hostname}, "network_adapter_discovery")
         end
     elseif protocol=="network_adapter_http" then handleHTTP(sender,message)
-    elseif protocol=="network_adapter_ws" then handleWebSocket(sender,message) end
+    elseif protocol=="network_adapter_ws" then handleWebSocket(sender,message)
+    elseif protocol=="network_adapter_udp" then handleUDP(sender,message) end
 end
 
 local function handlePing(sender,message)
@@ -290,11 +381,24 @@ local function cleanupCache()
     for h,e in pairs(network_state.dns_cache) do if e.expires<now then network_state.dns_cache[h]=nil; cleaned=cleaned+1 end end
     for ip,e in pairs(network_state.arp_cache) do if e.expires<now then network_state.arp_cache[ip]=nil; cleaned=cleaned+1 end end
     for id,c in pairs(network_state.connections) do local to=(cfg.advanced and cfg.advanced.connection_timeout or 30)*1000; if (now-c.lastActivity)>to then network_state.connections[id]=nil; cleaned=cleaned+1 end end
+    -- Cleanup inactive UDP sockets
+    for port,socket in pairs(network_state.udp_sockets) do
+        if socket.expires and socket.expires < now then
+            network_state.udp_sockets[port] = nil
+            cleaned = cleaned + 1
+            logger:debug("Cleaned up expired UDP socket on port %d", port)
+        end
+    end
     if cleaned>0 then logger:debug("Cleaned %d expired cache entries", cleaned) end
 end
 
 local function writeStats()
     network_state.stats.uptime = os.epoch("utc") - network_state.start_time
+    -- Include UDP stats if available
+    if udp then
+        local udpStats = udp.getStatistics()
+        network_state.stats.udp_details = udpStats
+    end
     local f=fs.open("/var/run/netd.stats","w"); if f then f.write(textutils.serialize(network_state.stats)); f.close() end
 end
 
@@ -331,11 +435,19 @@ local function mainLoop()
             elseif proto==cfg.arp_proto then handleARP(sender,msg)
             elseif proto==cfg.http_proto then handleHTTP(sender,msg)
             elseif proto==cfg.ws_proto then handleWebSocket(sender,msg)
+            elseif proto==cfg.udp_proto or proto=="UDP_PACKET" then handleUDP(sender,msg)
             elseif proto and proto:match("^ping_") then handlePing(sender,msg)
             elseif proto and proto:match("^network_adapter") then handleNetworkAdapter(sender,msg,proto)
             elseif proto=="network_packet" and type(msg)=="table" then
                 if msg.type=="http_request" then handleHTTP(sender,msg)
-                elseif msg.type and msg.type:match("^%w*ws_%w+") then handleWebSocket(sender,msg) end
+                elseif msg.type and msg.type:match("^%w*ws_%w+") then handleWebSocket(sender,msg)
+                elseif msg.protocol == "UDP" then handleUDP(sender,msg) end
+            end
+        elseif ev[1]=="udp_packet" and udp then
+            -- Handle UDP packet events from the UDP protocol
+            local port, packet = ev[2], ev[3]
+            if network_state.udp_sockets[port] then
+                network_state.udp_sockets[port].lastActivity = os.epoch("utc")
             end
 
         elseif ev[1]=="timer" then
@@ -369,6 +481,13 @@ end
 
 local function shutdown()
     logger:info("Shutting down %s", daemon_name)
+
+    -- Shutdown UDP if available
+    if udp then
+        udp.stop()
+        logger:info("UDP protocol stopped")
+    end
+
     saveState(); writeStats()
     for id,_ in pairs(network_state.connections) do logger:debug("Closing connection: %s", id) end
     network_state.connections={}
@@ -380,12 +499,17 @@ end
 
 local function main()
     local modem = initNetwork()
-    if modem then logger:info("Network daemon ready with full functionality")
+    if modem then logger:info("Network daemon ready with full functionality (UDP enabled: %s)", tostring(udp ~= nil))
     else logger:warn("Network daemon ready with limited functionality (no modem)") end
 
     local ok,err = pcall(mainLoop)
     if not ok then logger:error("Main loop error: %s", err) end
     shutdown()
+end
+
+-- Register UDP as global for other protocols to use
+if udp then
+    _G.netd_udp = udp
 end
 
 main()

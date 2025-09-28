@@ -1,7 +1,6 @@
 -- /lib/network.lua
--- Network library for interacting with netd
+-- Network library for interacting with netd (with UDP support)
 -- Provides high-level network functions for applications
--- FIXED: HTTP server implementation
 
 local network = {}
 
@@ -10,6 +9,7 @@ local cfg = nil
 local cfg_loaded = false
 local modem_available = false
 local active_servers = {}  -- Store server handlers in memory
+local udp_sockets = {}  -- Track UDP sockets
 
 -- Load configuration
 local function loadConfig()
@@ -38,6 +38,10 @@ local function loadConfig()
                 local info = textutils.unserialize(info_data)
                 if info and info.modem_available ~= nil then
                     modem_available = info.modem_available
+                end
+                -- Check if UDP is enabled
+                if info and info.udp_enabled then
+                    network.udp_enabled = true
                 end
             end
 
@@ -68,9 +72,11 @@ local function loadConfig()
                     dns_proto = "ccnet_dns",
                     arp_proto = "ccnet_arp",
                     http_proto = "ccnet_http",
-                    ws_proto = "ccnet_ws"
+                    ws_proto = "ccnet_ws",
+                    udp_proto = "ccnet_udp"
                 }
                 modem_available = info.modem_available or false
+                network.udp_enabled = info.udp_enabled or false
                 cfg_loaded = true
                 return cfg
             end
@@ -115,7 +121,8 @@ function network.getInfo()
                 gateway = info.gateway or cfg.gateway,
                 dns = info.dns or cfg.dns,
                 modem_available = info.modem_available,
-                computer_id = os.getComputerID()
+                computer_id = os.getComputerID(),
+                udp_enabled = info.udp_enabled or false
             }
         end
     end
@@ -129,7 +136,8 @@ function network.getInfo()
         gateway = cfg.gateway,
         dns = cfg.dns,
         modem_available = modem_available,
-        computer_id = os.getComputerID()
+        computer_id = os.getComputerID(),
+        udp_enabled = network.udp_enabled or false
     }
 end
 
@@ -140,169 +148,162 @@ function network.getStats()
         local file = fs.open(stats_path, "r")
         local data = file.readAll()
         file.close()
-        return textutils.unserialize(data)
-    end
-    return nil
-end
-
--- Discover network devices
-function network.discover(timeout)
-    if not cfg then loadConfig() end
-    if not modem_available then return {} end
-
-    ensureModemOpen()
-    timeout = timeout or 3
-
-    -- Send discovery broadcast
-    rednet.broadcast({type = "query"}, cfg.discovery_proto)
-
-    local devices = {}
-    local endTime = os.clock() + timeout
-
-    while os.clock() < endTime do
-        local remaining = endTime - os.clock()
-        if remaining <= 0 then break end
-
-        local timer = os.startTimer(remaining)
-        local event, sender, message, protocol = os.pullEvent()
-
-        if event == "rednet_message" and protocol == cfg.discovery_proto then
-            if type(message) == "table" and message.type == "response" then
-                table.insert(devices, {
-                    id = sender,
-                    hostname = message.hostname,
-                    ip = message.ip,
-                    mac = message.mac,
-                    services = message.services or {}
-                })
-            end
-        elseif event == "timer" and sender == timer then
-            break
-        else
-            os.cancelTimer(timer)
+        local stats = textutils.unserialize(data)
+        if stats then
+            return stats
         end
     end
 
-    return devices
+    return {
+        packets_sent = 0,
+        packets_received = 0,
+        bytes_sent = 0,
+        bytes_received = 0,
+        dns_queries = 0,
+        arp_requests = 0,
+        http_requests = 0,
+        websocket_connections = 0,
+        udp_packets = 0,
+        uptime = 0
+    }
 end
 
--- DNS resolution
-function network.resolve(hostname)
+-- ==================== UDP Support ====================
+
+-- Create UDP socket
+function network.udpSocket(port, options)
     if not cfg then loadConfig() end
 
-    -- Check special cases
-    if hostname == "localhost" then
-        return "127.0.0.1"
-    elseif hostname == cfg.hostname or hostname == cfg.fqdn then
-        return cfg.ipv4
+    -- Load UDP module if not already loaded
+    if not network.udp and fs.exists("/protocols/udp.lua") then
+        network.udp = dofile("/protocols/udp.lua")
     end
 
-    if not modem_available then return nil end
+    if not network.udp then
+        error("UDP protocol not available")
+    end
+
+    -- Create socket using UDP protocol
+    local socket = network.udp.socket(port, options)
+
+    -- Track socket for cleanup
+    udp_sockets[socket.port] = socket
+
+    return socket
+end
+
+-- Send UDP datagram (convenience function)
+function network.udpSend(destIP, destPort, data, sourcePort)
+    if not cfg then loadConfig() end
+
+    -- Create temporary socket if sourcePort not specified
+    local socket = nil
+    local tempSocket = false
+
+    if sourcePort and udp_sockets[sourcePort] then
+        socket = udp_sockets[sourcePort]
+    else
+        socket = network.udpSocket(sourcePort)
+        tempSocket = true
+    end
+
+    -- Send the data
+    local success, err = socket:send(data, destIP, destPort)
+
+    -- Close temporary socket
+    if tempSocket then
+        socket:close()
+        udp_sockets[socket.port] = nil
+    end
+
+    return success, err
+end
+
+-- Listen for UDP on specific port
+function network.udpListen(port, callback)
+    if not cfg then loadConfig() end
+
+    local socket = network.udpSocket(port)
+    socket:bind(port)
+
+    if callback then
+        socket:setReceiveCallback(callback)
+    end
+
+    return socket
+end
+
+-- Get UDP statistics
+function network.getUDPStats()
+    if network.udp then
+        return network.udp.getStatistics()
+    end
+
+    return {
+        packets_sent = 0,
+        packets_received = 0,
+        bytes_sent = 0,
+        bytes_received = 0,
+        active_sockets = 0
+    }
+end
+
+-- ==================== DNS functions ====================
+
+-- Resolve hostname
+function network.resolve(hostname)
+    if not cfg then loadConfig() end
+    if not modem_available then return nil, "No modem available" end
 
     ensureModemOpen()
 
-    -- Send DNS query
-    rednet.broadcast({type = "query", hostname = hostname}, cfg.dns_proto)
+    -- Check if it's an IP address
+    if hostname:match("^%d+%.%d+%.%d+%.%d+$") then
+        return hostname
+    end
+
+    -- Check for localhost
+    if hostname == "localhost" then
+        return "127.0.0.1"
+    end
+
+    -- Check for our own hostname
+    if hostname == cfg.hostname or hostname == cfg.fqdn then
+        return cfg.ipv4
+    end
+
+    -- Query DNS via rednet
+    rednet.broadcast({
+        type = "query",
+        hostname = hostname
+    }, cfg.dns_proto)
 
     -- Wait for response
-    local timer = os.startTimer(2)
+    local timer = os.startTimer(3)
     while true do
         local event, param1, param2, param3 = os.pullEvent()
         if event == "rednet_message" and param3 == cfg.dns_proto then
-            local sender, message = param1, param2
+            local message = param2
             if type(message) == "table" and message.type == "response" and message.hostname == hostname then
                 os.cancelTimer(timer)
                 return message.ip
             end
         elseif event == "timer" and param1 == timer then
-            return nil
+            return nil, "DNS resolution timeout"
         end
     end
 end
 
--- Ping
-function network.ping(target, count)
-    if not cfg then loadConfig() end
-    if not modem_available then return nil end
+-- ==================== HTTP functions ====================
 
-    ensureModemOpen()
-
-    -- Resolve target if needed
-    local targetIp = target
-    if not target:match("^%d+%.%d+%.%d+%.%d+$") then
-        targetIp = network.resolve(target)
-        if not targetIp then
-            return {sent = 0, received = 0, lost = 0}
-        end
-    end
-
-    count = count or 4
-    local results = {
-        sent = 0,
-        received = 0,
-        lost = 0,
-        times = {}
-    }
-
-    for i = 1, count do
-        results.sent = results.sent + 1
-        local startTime = os.epoch("utc")
-
-        rednet.broadcast({
-            type = "ping",
-            seq = i,
-            source = cfg.ipv4,
-            dest = targetIp,
-            timestamp = startTime
-        }, "ping_" .. cfg.ipv4)
-
-        local timer = os.startTimer(1)
-        local gotReply = false
-
-        while not gotReply do
-            local event, param1, param2, param3 = os.pullEvent()
-            if event == "rednet_message" and param3 == "pong_" .. cfg.ipv4 then
-                local sender, message = param1, param2
-                if type(message) == "table" and message.type == "pong" and message.seq == i then
-                    local endTime = os.epoch("utc")
-                    local rtt = endTime - startTime
-                    table.insert(results.times, rtt)
-                    results.received = results.received + 1
-                    gotReply = true
-                    os.cancelTimer(timer)
-                end
-            elseif event == "timer" and param1 == timer then
-                results.lost = results.lost + 1
-                break
-            end
-        end
-    end
-
-    -- Calculate statistics
-    if #results.times > 0 then
-        local sum = 0
-        results.min_time = results.times[1]
-        results.max_time = results.times[1]
-
-        for _, time in ipairs(results.times) do
-            sum = sum + time
-            if time < results.min_time then results.min_time = time end
-            if time > results.max_time then results.max_time = time end
-        end
-
-        results.avg_time = sum / #results.times
-    end
-
-    return results
-end
-
--- HTTP client
+-- HTTP request
 function network.http(url, options)
     if not cfg then loadConfig() end
     options = options or {}
 
     -- Parse URL
-    local protocol, host, port, path = url:match("^(%w+)://([^:/]+):?(%d*)(/?.*)$")
+    local protocol, host, port, path
+    protocol, host, port, path = url:match("^(%w+)://([^:/]+):?(%d*)(/?.*)$")
     if not protocol then
         host, port, path = url:match("^([^:/]+):?(%d*)(/?.*)$")
         protocol = "http"
@@ -314,251 +315,81 @@ function network.http(url, options)
     -- Check if local or remote
     local isLocal = host == "localhost" or
             host == cfg.hostname or
-            host == cfg.fqdn or
             host:match("^10%.") or
-            host:match("^192%.168%.") or
-            host:match("^cc%-")
+            host:match("^192%.168%.")
 
     if isLocal and modem_available then
+        -- Local HTTP via rednet
         ensureModemOpen()
 
-        -- Resolve hostname to computer ID
-        local targetId = nil
-        if host == "localhost" or host == cfg.hostname then
-            targetId = os.getComputerID()
-        else
-            -- Broadcast discovery to find target
-            rednet.broadcast({type = "id_query", ip = host}, cfg.discovery_proto)
-            local timer = os.startTimer(2)
-
-            while true do
-                local event, param1, param2, param3 = os.pullEvent()
-                if event == "rednet_message" and param3 == cfg.discovery_proto then
-                    local sender, message = param1, param2
-                    if type(message) == "table" and message.type == "id_response" and message.ip == host then
-                        targetId = sender
-                        os.cancelTimer(timer)
-                        break
-                    end
-                elseif event == "timer" and param1 == timer then
-                    break
-                end
-            end
-        end
-
-        if not targetId then
-            -- Try to resolve via hostname
-            rednet.broadcast({type = "query"}, cfg.discovery_proto)
-            local timer = os.startTimer(2)
-
-            while true do
-                local event, param1, param2, param3 = os.pullEvent()
-                if event == "rednet_message" and param3 == cfg.discovery_proto then
-                    local sender, message = param1, param2
-                    if type(message) == "table" and message.hostname == host then
-                        targetId = sender
-                        os.cancelTimer(timer)
-                        break
-                    end
-                elseif event == "timer" and param1 == timer then
-                    return nil, "Host not found"
-                end
-            end
-        end
-
-        -- Create HTTP request packet
-        local requestId = math.random(1000000)
-        local packet = {
-            type = "request",
-            id = requestId,
+        -- Create request
+        local request = {
+            type = "http_request",
             method = options.method or "GET",
             path = path,
-            port = port,
             headers = options.headers or {},
             body = options.body,
-            timestamp = os.epoch("utc")
+            port = port,
+            id = os.epoch("utc")
         }
 
-        -- Send to target
-        if targetId == os.getComputerID() then
-            -- Local request - send via broadcast for netd to handle
-            rednet.broadcast(packet, cfg.http_proto)
-        else
-            rednet.send(targetId, packet, cfg.http_proto)
-        end
+        -- Send request
+        rednet.broadcast(request, cfg.http_proto)
 
         -- Wait for response
-        local timeout = os.startTimer(options.timeout or 5)
-
+        local timer = os.startTimer(options.timeout or 5)
         while true do
             local event, param1, param2, param3 = os.pullEvent()
             if event == "rednet_message" and param3 == cfg.http_proto then
-                local sender, response = param1, param2
-                if type(response) == "table" and response.type == "response" and response.id == requestId then
-                    os.cancelTimer(timeout)
-
-                    -- Create response object
+                local sender, message = param1, param2
+                if type(message) == "table" and message.type == "response" and message.id == request.id then
+                    os.cancelTimer(timer)
                     return {
-                        readAll = function() return response.body end,
-                        getResponseCode = function() return response.code end,
-                        getResponseHeaders = function() return response.headers end,
+                        getResponseCode = function() return message.code end,
+                        readAll = function() return message.body end,
                         close = function() end
                     }
                 end
-            elseif event == "timer" and param1 == timeout then
+            elseif event == "timer" and param1 == timer then
                 return nil, "Request timeout"
             end
         end
     else
-        -- Remote request using native HTTP
-        if options.method == "GET" then
-            return http.get(url, options.headers)
-        elseif options.method == "POST" then
-            return http.post(url, options.body, options.headers)
-        else
-            return http.request({
-                url = url,
-                method = options.method,
-                headers = options.headers,
-                body = options.body
-            })
-        end
-    end
-end
-
--- Create HTTP server (local network only)
-function network.createServer(port, handler)
-    if not cfg then loadConfig() end
-    if not modem_available then
-        return nil, "No modem available for local server"
-    end
-
-    ensureModemOpen()
-
-    -- Store the handler in memory
-    active_servers[port] = {
-        handler = handler,
-        created = os.epoch("utc"),
-        port = port
-    }
-
-    -- Register server with netd by sending a message
-    rednet.broadcast({
-        type = "register_server",
-        port = port,
-        hostname = cfg.hostname,
-        ip = cfg.ipv4
-    }, cfg.http_proto)
-
-    -- Start server loop in a coroutine
-    local serverRunning = true
-
-    local function serverLoop()
-        while serverRunning do
-            local sender, message, protocol = rednet.receive()
-
-            if protocol == cfg.http_proto and type(message) == "table" then
-                if (message.type == "request" or message.type == "http_request") and
-                        (message.port == port or (message.port == nil and port == 80)) then
-
-                    -- Call the handler
-                    local success, result = pcall(handler, {
-                        method = message.method or "GET",
-                        path = message.path or "/",
-                        headers = message.headers or {},
-                        body = message.body or "",
-                        query = message.query or {},
-                        source = sender
-                    })
-
-                    local response
-                    if success and type(result) == "table" then
-                        response = result
-                    elseif success then
-                        -- Handler returned non-table, treat as body
-                        response = {
-                            code = 200,
-                            headers = {["Content-Type"] = "text/plain"},
-                            body = tostring(result)
-                        }
-                    else
-                        -- Handler error
-                        response = {
-                            code = 500,
-                            headers = {["Content-Type"] = "text/plain"},
-                            body = "Internal Server Error"
-                        }
-                    end
-
-                    -- Ensure response has required fields
-                    response.type = "response"
-                    response.id = message.id
-                    response.code = response.code or 200
-                    response.headers = response.headers or {}
-                    response.body = response.body or ""
-                    response.timestamp = os.epoch("utc")
-
-                    -- Send response back
-                    rednet.send(sender, response, cfg.http_proto)
-                end
-            elseif protocol == "server_control" and type(message) == "table" then
-                if message.action == "stop" and message.port == port then
-                    serverRunning = false
-                    break
+        -- External HTTP via native API
+        if protocol == "http" then
+            if options.method == "POST" then
+                return http.post(url, options.body, options.headers)
+            else
+                return http.get(url, options.headers)
+            end
+        elseif protocol == "https" then
+            if http.checkURL then
+                local ok = http.checkURL(url)
+                if not ok then
+                    return nil, "Invalid HTTPS URL"
                 end
             end
+            if options.method == "POST" then
+                return http.post(url, options.body, options.headers)
+            else
+                return http.get(url, options.headers)
+            end
         end
-
-        -- Cleanup
-        active_servers[port] = nil
     end
-
-    -- Return server control object
-    return {
-        port = port,
-        stop = function()
-            serverRunning = false
-            active_servers[port] = nil
-            rednet.broadcast({action = "stop", port = port}, "server_control")
-        end,
-        isRunning = function()
-            return serverRunning
-        end,
-        start = function()
-            return parallel.waitForAny(serverLoop)
-        end
-    }
 end
 
--- Stop a server
-function network.stopServer(port)
-    if active_servers[port] then
-        active_servers[port] = nil
-        rednet.broadcast({action = "stop", port = port}, "server_control")
-        return true
-    end
-    return false
-end
+-- ==================== WebSocket functions ====================
 
--- List active servers
-function network.getActiveServers()
-    local servers = {}
-    for port, server in pairs(active_servers) do
-        table.insert(servers, {
-            port = port,
-            created = server.created
-        })
-    end
-    return servers
-end
-
--- WebSocket client (supports both local and remote)
+-- WebSocket connection
 function network.websocket(url)
     if not cfg then loadConfig() end
 
     -- Parse URL
-    local protocol, host, port, path = url:match("^(%w+)://([^:/]+):?(%d*)(/?.*)$")
-    if not protocol then
+    local protocol, host, port, path
+    protocol = url:match("^(%w+)://")
+    if protocol then
+        host, port, path = url:match("^%w+://([^:/]+):?(%d*)(/?.*)$")
+    else
         host, port, path = url:match("^([^:/]+):?(%d*)(/?.*)$")
         protocol = "ws"
     end
@@ -609,7 +440,7 @@ function network.websocket(url)
             end
         end
 
-        -- Return WebSocket object
+        -- Return WebSocket object with UDP-like interface
         return {
             send = function(data)
                 rednet.send(peerId, {
@@ -633,7 +464,7 @@ function network.websocket(url)
                             return message.data
                         end
                     elseif event == "timer" and timer and param1 == timer then
-                        return nil
+                        return nil, "Receive timeout"
                     end
                 end
             end,
@@ -646,10 +477,183 @@ function network.websocket(url)
             end
         }
     else
-        -- Remote WebSocket using native API
-        local ws_url = url:gsub("^http", "ws")
-        return http.websocket(ws_url)
+        -- External WebSocket via native API
+        local fullUrl = protocol .. "://" .. host .. ":" .. port .. path
+        if protocol:match("^wss?$") then
+            return http.websocket(fullUrl)
+        else
+            return nil, "Invalid WebSocket protocol"
+        end
     end
+end
+
+-- ==================== Server functions ====================
+
+-- HTTP server (existing implementation)
+function network.httpServer(port, handler)
+    if not cfg then loadConfig() end
+    if not modem_available then
+        return nil, "No modem available"
+    end
+
+    port = port or 80
+
+    -- Store handler in memory
+    active_servers[port] = {
+        port = port,
+        handler = handler,
+        type = "http"
+    }
+
+    -- Notify netd about the server by sending a registration message
+    ensureModemOpen()
+    rednet.broadcast({
+        type = "server_register",
+        port = port,
+        protocol = "http"
+    }, cfg.proto)
+
+    return {
+        port = port,
+        stop = function()
+            active_servers[port] = nil
+            rednet.broadcast({
+                type = "server_unregister",
+                port = port
+            }, cfg.proto)
+        end,
+
+        listen = function()
+            ensureModemOpen()
+            while active_servers[port] do
+                local event, sender, message, protocol = os.pullEvent("rednet_message")
+                if protocol == cfg.http_proto and type(message) == "table" and
+                        (message.type == "http_request" or message.type == "request") then
+                    if message.port == port then
+                        -- Process request
+                        local request = {
+                            method = message.method or "GET",
+                            path = message.path or "/",
+                            headers = message.headers or {},
+                            body = message.body,
+                            source = sender
+                        }
+
+                        local response = handler(request)
+                        if response then
+                            rednet.send(sender, {
+                                type = "response",
+                                id = message.id,
+                                code = response.code or 200,
+                                headers = response.headers or {},
+                                body = response.body or ""
+                            }, cfg.http_proto)
+                        end
+                    end
+                end
+            end
+        end
+    }
+end
+
+-- WebSocket server (existing implementation)
+function network.wsServer(port, handler)
+    if not cfg then loadConfig() end
+    if not modem_available then
+        return nil, "No modem available"
+    end
+
+    port = port or 8080
+
+    -- Store handler
+    active_servers[port] = {
+        port = port,
+        handler = handler,
+        type = "websocket"
+    }
+
+    -- Register with netd
+    ensureModemOpen()
+    rednet.broadcast({
+        type = "server_register",
+        port = port,
+        protocol = "websocket"
+    }, cfg.proto)
+
+    return {
+        port = port,
+        stop = function()
+            active_servers[port] = nil
+            rednet.broadcast({
+                type = "server_unregister",
+                port = port
+            }, cfg.proto)
+        end,
+
+        listen = function()
+            ensureModemOpen()
+            local connections = {}
+
+            while active_servers[port] do
+                local event, param1, param2, param3 = os.pullEvent()
+
+                if event == "rednet_message" and param3 == cfg.ws_proto then
+                    local sender, message = param1, param2
+
+                    if type(message) == "table" then
+                        if message.type == "ws_connect" and message.url and message.url.port == port then
+                            -- Accept connection
+                            local connId = message.connectionId
+                            connections[connId] = {
+                                peer = sender,
+                                established = os.epoch("utc")
+                            }
+
+                            rednet.send(sender, {
+                                type = "ws_accept",
+                                connectionId = connId
+                            }, cfg.ws_proto)
+
+                            if handler then
+                                handler("connect", connId, nil)
+                            end
+
+                        elseif message.type == "ws_data" and connections[message.connectionId] then
+                            -- Handle data
+                            if handler then
+                                handler("data", message.connectionId, message.data)
+                            end
+
+                        elseif message.type == "ws_close" and connections[message.connectionId] then
+                            -- Handle close
+                            if handler then
+                                handler("close", message.connectionId, nil)
+                            end
+                            connections[message.connectionId] = nil
+                        end
+                    end
+                end
+            end
+        end
+    }
+end
+
+-- Cleanup function
+function network.cleanup()
+    -- Close all UDP sockets
+    for port, socket in pairs(udp_sockets) do
+        socket:close()
+    end
+    udp_sockets = {}
+
+    -- Stop all servers
+    for port, server in pairs(active_servers) do
+        rednet.broadcast({
+            type = "server_unregister",
+            port = port
+        }, cfg.proto)
+    end
+    active_servers = {}
 end
 
 return network

@@ -1,4 +1,5 @@
--- connection_manager.lua
+-- /util/connection_manager.lua
+-- Connection manager with UDP support
 local Logger = require("util.logger")
 
 local ConnectionManager = {}
@@ -33,6 +34,7 @@ local PROTOCOL_NAMES = {
     https = "HTTPS",
     webrtc = "WebRTC",
     tcp = "TCP",
+    udp = "UDP",  -- Add UDP
     mqtt = "MQTT",
     ftp = "FTP",
     ssh = "SSH"
@@ -58,6 +60,9 @@ local STATUSES = {
     webrtc_ice = "webrtc_ice",
     tcp_listening = "tcp_listening",
     tcp_established = "tcp_established",
+    udp_bound = "udp_bound",  -- Add UDP statuses
+    udp_sending = "udp_sending",
+    udp_receiving = "udp_receiving",
     mqtt_subscribed = "mqtt_subscribed",
     mqtt_published = "mqtt_published",
     ftp_logged_in = "ftp_logged_in",
@@ -80,6 +85,7 @@ function ConnectionManager:new(options)
         https = 443,
         webrtc = 9000,
         tcp = 8080,
+        udp = 0,  -- 0 means auto-assign for UDP
         mqtt = 1883,
         ftp = 21,
         ssh = 22
@@ -92,7 +98,7 @@ function ConnectionManager:new(options)
 
     if obj.logger then
         obj.logger:info("ConnectionManager initialized")
-        obj.logger:debug("Default ports configured for %d protocols", 8)
+        obj.logger:debug("Default ports configured for %d protocols", 9)
     end
 
     obj:loadProtocols()
@@ -116,6 +122,7 @@ function ConnectionManager:loadProtocols()
         https = "protocols.http_client",
         webrtc = "protocols.webrtc",
         tcp = "protocols.tcp",
+        udp = "protocols.udp",  -- Add UDP protocol
         mqtt = "protocols.mqtt",
         ftp = "protocols.ftp",
         ssh = "protocols.ssh"
@@ -125,59 +132,66 @@ function ConnectionManager:loadProtocols()
         local success, protocol = pcall(require, path)
         if success then
             self.protocols[name] = protocol
-            print(string.format("[Manager] Loaded protocol: %s", protocol.PROTOCOL_NAME or name))
             if self.logger then
-                self.logger:info("Loaded protocol: %s from %s", name, path)
+                self.logger:debug("Loaded protocol: %s", name)
             end
         else
-            print(string.format("[Manager] Failed to load %s: %s", name, protocol))
-            if self.logger then
-                self.logger:error("Failed to load protocol %s from %s: %s", name, path, tostring(protocol))
+            -- Try alternative loading method
+            local altPath = "/" .. path:gsub("%.", "/") .. ".lua"
+            if fs.exists(altPath) then
+                success, protocol = pcall(dofile, altPath)
+                if success then
+                    self.protocols[name] = protocol
+                    if self.logger then
+                        self.logger:debug("Loaded protocol from file: %s", name)
+                    end
+                else
+                    if self.logger then
+                        self.logger:warn("Failed to load protocol %s: %s", name, protocol)
+                    end
+                end
+            else
+                if self.logger then
+                    self.logger:warn("Protocol file not found: %s", name)
+                end
             end
         end
     end
 end
 
 function ConnectionManager:createConnection(protocolName, address, options)
-    if self.logger then
-        self.logger:info("Creating %s connection to %s", protocolName, address)
-    end
-
+    protocolName = string.lower(protocolName)
     local protocol = self.protocols[protocolName]
-    options = options or {}
-    local conn = nil
 
     if not protocol then
-        local err = string.format("Protocol '%s' not supported", protocolName)
+        local err = "Protocol not loaded: " .. protocolName
         if self.logger then self.logger:error(err) end
         error(err)
     end
 
+    -- Parse address based on protocol
     local host, port, path = self:parseAddress(address, protocolName)
 
-    port = port or self.defaultPorts[protocolName]
-    if not port then
-        local err = string.format("No default port for protocol '%s'", protocolName)
-        if self.logger then self.logger:error(err) end
-        error(err)
-    end
-
-    if self.logger then
-        self.logger:debug("Parsed address - Host: %s, Port: %d, Path: %s", host, port, path or "/")
-    end
-
-    -- Pass logger to protocol instances
-    options.logger = options.logger or self.logger
-
+    -- Create connection based on protocol
+    local conn
     if protocolName == "websocket" then
         conn = protocol:new(address, options)
     elseif protocolName == "http" or protocolName == "https" then
-        conn = protocol:new(address, options)
+        conn = protocol:new(host, options)
+        conn.port = port
+        conn.path = path
     elseif protocolName == "webrtc" then
         -- WebRTC uses peer ID instead of host:port
         conn = protocol:new(address, options)
     elseif protocolName == "tcp" then
         conn = protocol:new(host, port, options)
+    elseif protocolName == "udp" then
+        -- UDP socket creation
+        conn = protocol.socket(port, options)
+        if host then
+            -- Store destination for later sends
+            conn.defaultDest = {ip = host, port = port}
+        end
     elseif protocolName == "mqtt" then
         conn = protocol:new(host, port, options)
     elseif protocolName == "ftp" then
@@ -211,7 +225,10 @@ function ConnectionManager:createConnection(protocolName, address, options)
             bytesReceived = 0,
             messagesSent = 0,
             messagesReceived = 0,
-            errors = 0
+            errors = 0,
+            -- UDP specific stats
+            packetsDropped = 0,
+            outOfOrder = 0
         },
         debugString = ConnectionManager.connectionDebugString
     }
@@ -229,569 +246,361 @@ end
 
 function ConnectionManager:parseAddress(address, protocolName)
     local host, port, path
-    local url_pattern = "^(%w+)://([^:/]+):?(%d*)(/?.*)$"
-    local host_port_pattern = "^([^:/]+):?(%d*)$"
-    local pro, h, p, pa = address:match(url_pattern)
 
-    if h then
-        host = h
-        port = tonumber(p) or self.defaultPorts[protocolName]
-        path = pa ~= "" and pa or "/"
-    else
-        local h2, p2 = address:match(host_port_pattern)
-        if h2 then
-            host = h2
-            port = tonumber(p2) or self.defaultPorts[protocolName]
-        else
-            host = address
-            port = self.defaultPorts[protocolName]
+    -- Special handling for UDP addresses
+    if protocolName == "udp" then
+        if type(address) == "table" then
+            host = address.host or address.ip
+            port = address.port
+        elseif type(address) == "string" then
+            host, port = address:match("^([^:]+):(%d+)$")
+            if not host then
+                -- Maybe just a port number
+                port = tonumber(address)
+            end
+        elseif type(address) == "number" then
+            port = address
         end
-        path = "/"
+        port = tonumber(port) or 0
+        return host, port, nil
     end
+
+    -- Standard URL parsing for other protocols
+    local url_pattern = "^(%w+)://([^:/]+):?(%d*)(/?.*)$"
+    local host_port_pattern = "^([^:/]+):?(%d*)(/?.*)$"
+
+    local protocol_match, h, p, pa = address:match(url_pattern)
+    if protocol_match then
+        host, port, path = h, p, pa
+    else
+        host, port, path = address:match(host_port_pattern)
+    end
+
+    -- Default ports if not specified
+    port = tonumber(port) or self.defaultPorts[protocolName] or 80
+    path = path ~= "" and path or "/"
 
     return host, port, path
 end
 
-function ConnectionManager:connect(connId, credentials)
-    local connectionData = self.connections[connId]
-    if not connectionData then
-        local err = "Connection ID not found"
-        if self.logger then self.logger:error("Connect failed: %s", err) end
-        return false, error(err)
+function ConnectionManager:connect(connId, ...)
+    local conn = self.connections[connId]
+    if not conn then
+        error("Connection not found: " .. connId)
     end
 
-    local conn = connectionData.connection
-    local protocol = connectionData.protocol
+    self:DebugPrint(string.format("Connecting %s...", connId))
+    conn.status = STATUSES.connecting
 
-    connectionData.status = STATUSES.connecting
-    self:DebugPrint(string.format("Connecting to %s (%s)", connectionData.address, protocol))
+    local success, result, message
 
-    if protocol == "tcp" or protocol == "websocket" then
-        if conn.connect then
-            local success, err = conn:connect()
-            if success then
-                connectionData.status = STATUSES.connected
-                self:DebugPrint(string.format("Connected to %s", connectionData.address))
-                return success
-            else
-                connectionData.status = STATUSES.error
-                connectionData.stats.errors = connectionData.stats.errors + 1
-                self:DebugPrint(string.format("Connection error to %s: %s", connectionData.address, err))
-                return false, err
-            end
-        end
-    elseif protocol == "mqtt" then
-        if credentials and credentials.username and credentials.password then
-            local success, err = conn:connect(credentials.username, credentials.password)
-            if success then
-                connectionData.status = STATUSES.connected
-                self:DebugPrint(string.format("Connected to %s", connectionData.address))
-                return success
-            else
-                connectionData.status = STATUSES.error
-                connectionData.stats.errors = connectionData.stats.errors + 1
-                self:DebugPrint(string.format("Connection error to %s: %s", connectionData.address, err))
-                return false, err
-            end
+    if conn.protocol == "udp" then
+        -- UDP "connection" is just binding
+        if conn.port and conn.port > 0 then
+            success, message = conn.connection:bind(conn.port)
         else
-            local success, err = conn:connect()
-            if success then
-                connectionData.status = STATUSES.connected
-                self:DebugPrint(string.format("Connected to %s", connectionData.address))
-                return success
-            else
-                connectionData.status = STATUSES.error
-                connectionData.stats.errors = connectionData.stats.errors + 1
-                self:DebugPrint(string.format("Connection error to %s: %s", connectionData.address, err))
-                return false, err
-            end
+            success = true  -- Auto-assigned port
+            message = "Socket created with auto-assigned port"
         end
-    elseif protocol == "ftp" then
-        local success, err = conn:connect()
-        if success and credentials and credentials.username and credentials.password then
-            local loginSuccess, loginErr = conn:login(credentials.username, credentials.password)
-            if loginSuccess then
-                connectionData.status = STATUSES.connected
-                self:DebugPrint(string.format("Connected and logged in to %s", connectionData.address))
-                return true
-            else
-                connectionData.status = STATUSES.error
-                connectionData.stats.errors = connectionData.stats.errors + 1
-                self:DebugPrint(string.format("Login error to %s: %s", connectionData.address, loginErr))
-                return false, loginErr
-            end
-        end
-    elseif protocol == "ssh" then
-        local success, err = conn:connect()
-        if success and credentials then
-            local authSuccess, authErr
-            if credentials.password then
-                authSuccess, authErr = conn:passwordAuth(credentials.username, credentials.password)
-            elseif credentials.privateKey then
-                authSuccess, authErr = conn:publicKeyAuth(credentials.username, credentials.privateKey)
-            end
 
-            if authSuccess then
-                connectionData.status = STATUSES.connected
-                self:DebugPrint(string.format("Connected and authenticated to %s", connectionData.address))
-                return true
-            else
-                connectionData.status = STATUSES.error
-                connectionData.stats.errors = connectionData.stats.errors + 1
-                self:DebugPrint(string.format("Authentication error to %s: %s", connectionData.address, authErr))
-                return false, authErr
-            end
+        if success then
+            conn.status = STATUSES.udp_bound
+            result = STATUSES.connected
         else
-            connectionData.status = STATUSES.error
-            connectionData.stats.errors = connectionData.stats.errors + 1
-            self:DebugPrint(string.format("Missing credentials for SSH connection to %s", connectionData.address))
-            return false, "Missing credentials"
-        end
-    elseif protocol == "webrtc" then
-        if credentials and credentials.peerId then
-            local success, err = conn:connectToPeer(credentials.peerId, credentials.offer)
-            if success then
-                connectionData.status = STATUSES.connected
-                self:DebugPrint(string.format("Connected to %s", connectionData.address))
-                return success
-            else
-                connectionData.status = STATUSES.error
-                connectionData.stats.errors = connectionData.stats.errors + 1
-                self:DebugPrint(string.format("Connection error to %s: %s", connectionData.address, err))
-                return false, err
-            end
-        else
-            connectionData.status = STATUSES.error
-            connectionData.stats.errors = connectionData.stats.errors + 1
-            self:DebugPrint(string.format("Missing peer ID for WebRTC connection to %s", connectionData.address))
-            return false, "Missing peer ID"
-        end
-    elseif protocol == "http" or protocol == "https" then
-        -- HTTP connections are stateless; no persistent connection needed
-        connectionData.status = STATUSES.connected
-        self:DebugPrint(string.format("HTTP connection ready for %s", connectionData.address))
-        return true
-    else
-        connectionData.status = STATUSES.error
-        connectionData.stats.errors = connectionData.stats.errors + 1
-        self:DebugPrint(string.format("Unsupported protocol '%s' for connection to %s", protocol, connectionData.address))
-        return false, "Unsupported protocol"
-    end
-end
-
-function ConnectionManager:send(connId, data, options)
-    local connectionData = self.connections[connId]
-    if not connectionData then
-        local err = "Connection ID not found"
-        if self.logger then self.logger:error("Send failed: %s", err) end
-        return false, error(err)
-    end
-
-    local conn = connectionData.connection
-    local protocol = connectionData.protocol
-
-    connectionData.stats.messagesSent = connectionData.stats.messagesSent + 1
-    connectionData.stats.bytesSent = connectionData.stats.bytesSent + #tostring(data)
-
-    if self.logger then
-        self.logger:debug("Sending data via %s connection %s (%d bytes)", protocol, connId, #tostring(data))
-    end
-
-    if protocol == "http" or protocol == "https" then
-        if options and options.endpoint then
-            return conn:post(options.endpoint, data, options.headers)
-        else
-            return conn:post("/", data, options.headers)
-        end
-    elseif protocol == "mqtt" then
-        if options and options.topic then
-            return conn:publish(options.topic, data, options.qos or 0, options.retain or false)
-        else
-            return conn:publish("default", data, options.qos or 0, options.retain or false)
-        end
-    elseif protocol == "webrtc" then
-        if options and options.peerId then
-            return conn:sendDataToPeer(options.peerId, options.channel or "default", data)
-        else
-            return conn:sendDataToAllPeers(options.channel or "default", data)
-        end
-    elseif protocol == "ftp" then
-        if options and options.remotePath then
-            return conn:upload(options.localFile or data, options.remotePath)
-        else
-            return false, error("Missing remotePath for FTP upload")
-        end
-    elseif protocol == "ssh" then
-        if options and options.channel then
-            return conn:sendToChannel(options.channel, data)
-        else
-            return conn:executeCommand(data)
+            conn.status = STATUSES.error
+            result = STATUSES.error
         end
     else
-        return self:sendRaw(connId, data, options)
-    end
-end
+        -- Other protocols
+        success, result, message = pcall(conn.connection.connect, conn.connection, ...)
 
-function ConnectionManager:receive(id, timeout)
-    local connectionData = self.connections[id]
-    if not connectionData then
-        local err = "Connection ID not found"
-        if self.logger then self.logger:error("Receive failed: %s", err) end
-        return false, error(err)
+        if success then
+            conn.status = result == STATUSES.connected and STATUSES.connected or result
+        else
+            conn.status = STATUSES.error
+            result = STATUSES.error
+            message = result
+        end
     end
-
-    local conn = connectionData.connection
 
     if self.logger then
-        self.logger:debug("Receiving data from connection %s (timeout: %s)", id, tostring(timeout))
+        if success and result == STATUSES.connected then
+            self.logger:info("Connection %s established", connId)
+        else
+            self.logger:warn("Connection %s failed: %s", connId, message or "Unknown error")
+        end
     end
 
-    local timer = nil
-    if timeout and timeout > 0 then
-        timer = os.startTimer(timeout)
+    self:DebugPrint(string.format("Connection %s status: %s", connId, conn.status))
+    return success, result, message
+end
+
+function ConnectionManager:send(connId, data, ...)
+    local conn = self.connections[connId]
+    if not conn then
+        error("Connection not found: " .. connId)
     end
 
-    while true do
-        local event, param1, param2, param3 = os.pullEvent()
-        if event == "network_message" and param1 == id then
-            connectionData.stats.messagesReceived = connectionData.stats.messagesReceived + 1
-            connectionData.stats.bytesReceived = connectionData.stats.bytesReceived + #tostring(param2)
+    local success, result
 
+    if conn.protocol == "udp" then
+        -- UDP send with optional destination override
+        local destIP, destPort = ...
+        if not destIP and conn.connection.defaultDest then
+            destIP = conn.connection.defaultDest.ip
+            destPort = conn.connection.defaultDest.port
+        end
+
+        if destIP and destPort then
+            conn.status = STATUSES.udp_sending
+            success, result = pcall(conn.connection.send, conn.connection, data, destIP, destPort)
+        else
+            success = false
+            result = "No destination specified for UDP send"
+        end
+    else
+        -- Other protocols
+        success, result = pcall(conn.connection.send, conn.connection, data, ...)
+    end
+
+    if success then
+        conn.stats.messagesSent = conn.stats.messagesSent + 1
+        conn.stats.bytesSent = conn.stats.bytesSent + #tostring(data)
+        if self.logger then
+            self.logger:trace("Sent data on connection %s (%d bytes)", connId, #tostring(data))
+        end
+    else
+        conn.stats.errors = conn.stats.errors + 1
+        if self.logger then
+            self.logger:error("Failed to send on connection %s: %s", connId, result)
+        end
+    end
+
+    return success, result
+end
+
+function ConnectionManager:receive(connId, timeout)
+    local conn = self.connections[connId]
+    if not conn then
+        error("Connection not found: " .. connId)
+    end
+
+    local success, data, source
+
+    if conn.protocol == "udp" then
+        -- UDP receive with timeout
+        conn.status = STATUSES.udp_receiving
+        success, data, source = pcall(conn.connection.receive, conn.connection, timeout)
+
+        if success and data then
+            -- source contains {ip, port} for UDP
+            conn.stats.messagesReceived = conn.stats.messagesReceived + 1
+            conn.stats.bytesReceived = conn.stats.bytesReceived + #tostring(data)
             if self.logger then
-                self.logger:debug("Received message on connection %s (%d bytes)", id, #tostring(param2))
+                self.logger:trace("Received UDP data on connection %s from %s:%d (%d bytes)",
+                        connId, source.ip, source.port, #tostring(data))
             end
+            return true, data, source
+        end
+    else
+        -- Other protocols
+        success, data = pcall(conn.connection.receive, conn.connection, timeout)
 
-            if timer then
-                os.cancelTimer(timer)
+        if success and data then
+            conn.stats.messagesReceived = conn.stats.messagesReceived + 1
+            conn.stats.bytesReceived = conn.stats.bytesReceived + #tostring(data)
+            if self.logger then
+                self.logger:trace("Received data on connection %s (%d bytes)", connId, #tostring(data))
             end
-            return true, param2, param3
-        elseif event == "timer" and timer and param1 == timer then
-            break
+            return true, data
         end
     end
 
-    if self.logger then
-        self.logger:debug("Receive timeout on connection %s", id)
+    if not success then
+        conn.stats.errors = conn.stats.errors + 1
+        if self.logger then
+            self.logger:error("Failed to receive on connection %s: %s", connId, data or "Unknown error")
+        end
     end
 
-    return false, "Timeout"
+    return false, data
 end
 
-function ConnectionManager:getConnection(connId)
-    local connectionData = self.connections[connId]
-    return connectionData and connectionData.connection or nil
+function ConnectionManager:disconnect(connId)
+    local conn = self.connections[connId]
+    if not conn then
+        return false, "Connection not found"
+    end
+
+    self:DebugPrint(string.format("Disconnecting %s...", connId))
+
+    local success, result
+    if conn.connection.close then
+        success, result = pcall(conn.connection.close, conn.connection)
+    elseif conn.connection.disconnect then
+        success, result = pcall(conn.connection.disconnect, conn.connection)
+    else
+        success = true
+    end
+
+    if success then
+        conn.status = STATUSES.disconnected
+        if self.logger then
+            self.logger:info("Connection %s disconnected", connId)
+        end
+    else
+        if self.logger then
+            self.logger:warn("Failed to disconnect %s: %s", connId, result or "Unknown error")
+        end
+    end
+
+    -- Remove from active connections
+    self.connections[connId] = nil
+
+    return success, result
 end
 
-function ConnectionManager:getConnectionInfo(connId)
-    return self.connections[connId] or nil
+function ConnectionManager:getConnectionStatus(connId)
+    local conn = self.connections[connId]
+    if not conn then
+        return nil, "Connection not found"
+    end
+
+    return conn.status, conn.stats
 end
 
-function ConnectionManager:listConnections(protocol)
+function ConnectionManager:listConnections()
     local list = {}
-    for id, data in pairs(self.connections) do
-        if not protocol or data.protocol == protocol then
-            table.insert(list, {
-                id = id,
-                protocol = data.protocol,
-                address = data.address,
-                status = data.status,
-                createdAt = data.createdAt,
-                stats = data.stats
-            })
-        end
+    for id, conn in pairs(self.connections) do
+        table.insert(list, {
+            id = id,
+            protocol = conn.protocol,
+            address = conn.address,
+            status = conn.status,
+            created = conn.createdAt,
+            stats = conn.stats
+        })
     end
-
-    if self.logger then
-        self.logger:debug("Listed %d connections %s", #list, protocol and ("for protocol " .. protocol) or "total")
-    end
-
     return list
 end
 
-function ConnectionManager:closeConnection(connId)
-    local connectionData = self.connections[connId]
-    if not connectionData then
-        local err = "Connection ID not found"
-        if self.logger then self.logger:error("Close failed: %s", err) end
-        return false, error(err)
+function ConnectionManager:addEventListener(event, handler)
+    if not self.eventHandlers[event] then
+        self.eventHandlers[event] = {}
     end
-
-    local conn = connectionData.connection
-    local protocol = connectionData.protocol
-
-    if self.logger then
-        self.logger:info("Closing connection %s (%s)", connId, protocol)
-    end
-
-    if conn.close then
-        local success, err = conn:close()
-        if success then
-            connectionData.status = STATUSES.closed
-            self:DebugPrint(string.format("Closed connection to %s", connectionData.address))
-            self.connections[connId] = nil
-            return true
-        else
-            connectionData.status = STATUSES.error
-            connectionData.stats.errors = connectionData.stats.errors + 1
-            self:DebugPrint(string.format("Error closing connection to %s: %s", connectionData.address, err))
-            return false, err
-        end
-    else
-        self.connections[connId] = nil
-        self:DebugPrint(string.format("Removed connection to %s (no close method)", connectionData.address))
-        return true
-    end
+    table.insert(self.eventHandlers[event], handler)
 end
 
-function ConnectionManager:closeAllByProtocol(protocol)
-    local closedCount = 0
-
-    if self.logger then
-        self.logger:info("Closing all %s connections", protocol)
-    end
-
-    for connId, data in pairs(self.connections) do
-        if data.protocol == protocol then
-            local success, err = self:closeConnection(connId)
-            if success then
-                closedCount = closedCount + 1
-                self:DebugPrint(string.format("Closed connection %s", connId))
-            else
-                self:DebugPrint(string.format("Failed to close connection %s: %s", connId, err))
+function ConnectionManager:removeEventListener(event, handler)
+    if self.eventHandlers[event] then
+        for i, h in ipairs(self.eventHandlers[event]) do
+            if h == handler then
+                table.remove(self.eventHandlers[event], i)
+                break
             end
         end
     end
-
-    if self.logger then
-        self.logger:info("Closed %d %s connections", closedCount, protocol)
-    end
-
-    return closedCount
 end
 
-function ConnectionManager:closeAllConnections()
-    if self.logger then
-        self.logger:info("Closing all connections")
-    end
-
-    local totalCount = 0
-    for connId, _ in pairs(self.connections) do
-        local success, err = self:closeConnection(connId)
-        if success then
-            totalCount = totalCount + 1
-            self:DebugPrint(string.format("Closed connection %s", connId))
-        else
-            self:DebugPrint(string.format("Failed to close connection %s: %s", connId, err))
-        end
-    end
-
-    if self.logger then
-        self.logger:info("Closed %d total connections", totalCount)
-    end
-
-    return totalCount
-end
-
-function ConnectionManager:sendRaw(connId, data, options)
-    local connectionData = self.connections[connId]
-    if not connectionData then
-        local err = "Connection ID not found"
-        if self.logger then self.logger:error("SendRaw failed: %s", err) end
-        return false, error(err)
-    end
-
-    local conn = connectionData.connection
-    local protocol = connectionData.protocol
-
-    if conn.send then
-        local success, err = conn:send(data)
-        if success then
-            connectionData.stats.messagesSent = connectionData.stats.messagesSent + 1
-            connectionData.stats.bytesSent = connectionData.stats.bytesSent + #tostring(data)
-
-            if self.logger then
-                self.logger:trace("Raw send successful on connection %s", connId)
+function ConnectionManager:triggerEvent(event, ...)
+    if self.eventHandlers[event] then
+        for _, handler in ipairs(self.eventHandlers[event]) do
+            local success, err = pcall(handler, ...)
+            if not success and self.logger then
+                self.logger:error("Event handler error for %s: %s", event, err)
             end
-
-            return true
-        else
-            connectionData.status = STATUSES.error
-            connectionData.stats.errors = connectionData.stats.errors + 1
-            self:DebugPrint(string.format("Send error to %s: %s", connectionData.address, err))
-            return false, err
         end
-    else
-        return false, error("Send method not supported for this protocol")
     end
-end
-
-function ConnectionManager:setEventHandler(connId, event, handler)
-    local connectionData = self.connections[connId]
-    if not connectionData then
-        local err = "Connection ID not found"
-        if self.logger then self.logger:error("SetEventHandler failed: %s", err) end
-        return false, error(err)
-    end
-
-    local conn = connectionData.connection
-
-    if self.logger then
-        self.logger:debug("Setting event handler for %s on connection %s", event, connId)
-    end
-
-    if conn.on then
-        conn:on(event, handler)
-    else
-        return false, error("Event handling not supported for this protocol")
-    end
-
-    if not self.eventHandlers[connId] then
-        self.eventHandlers[connId] = {}
-    end
-    self.eventHandlers[connId][event] = handler
-    return true
 end
 
 function ConnectionManager:startConnectionMonitor()
-    if self.logger then
-        self.logger:info("Starting connection monitor")
-    end
+    -- Start a background task to monitor connection health
+    if not self.monitorRunning then
+        self.monitorRunning = true
 
-    parallel.waitForAny(function()
-        while true do
-            for connId, data in pairs(self.connections) do
-                local conn = data.connection
-                if conn.checkStatus then
-                    local status = conn:checkStatus()
-                    if status and status ~= data.status then
-                        local oldStatus = data.status
-                        data.status = status
-
-                        self:DebugPrint(string.format("Connection %s status changed from %s to %s",
-                                connId, oldStatus, status))
-
-                        -- Protocol-specific health checks or actions
-                        if self.eventHandlers[connId] and self.eventHandlers[connId]["status"] then
-                            pcall(self.eventHandlers[connId]["status"], connId, status)
+        -- This would typically run in a parallel thread
+        -- For now, we'll just set up the structure
+        self.monitorTask = function()
+            while self.monitorRunning do
+                for id, conn in pairs(self.connections) do
+                    -- Check connection health based on protocol
+                    if conn.protocol == "tcp" and conn.connection.isConnected then
+                        if not conn.connection:isConnected() then
+                            conn.status = STATUSES.disconnected
+                            self:triggerEvent("disconnected", id)
                         end
-                        if conn.onStatusChange then
-                            pcall(function() conn:onStatusChange(status) end)
+                    elseif conn.protocol == "websocket" and conn.connection.isOpen then
+                        if not conn.connection:isOpen() then
+                            conn.status = STATUSES.websocket_closed
+                            self:triggerEvent("disconnected", id)
                         end
                     end
+                    -- UDP doesn't have a connection state to monitor
                 end
+                sleep(5) -- Check every 5 seconds
             end
-            os.sleep(5)
-        end
-    end)
-end
-
-function ConnectionManager:getStats()
-    local stats = {
-        totalConnections = 0,
-        connectionsByProtocol = {},
-        totalBytesSent = 0,
-        totalBytesReceived = 0,
-        totalMessagesSent = 0,
-        totalMessagesReceived = 0,
-        totalErrors = 0
-    }
-
-    for _, data in pairs(self.connections) do
-        stats.totalConnections = stats.totalConnections + 1
-
-        local proto = data.protocol
-        if not stats.connectionsByProtocol[proto] then
-            stats.connectionsByProtocol[proto] = {
-                count = 0,
-                bytesSent = 0,
-                bytesReceived = 0,
-                messagesSent = 0,
-                messagesReceived = 0,
-                errors = 0
-            }
-        end
-
-        stats.connectionsByProtocol[proto].count = stats.connectionsByProtocol[proto].count + 1
-        stats.connectionsByProtocol[proto].bytesSent = stats.connectionsByProtocol[proto].bytesSent + data.stats.bytesSent
-        stats.connectionsByProtocol[proto].bytesReceived = stats.connectionsByProtocol[proto].bytesReceived + data.stats.bytesReceived
-        stats.connectionsByProtocol[proto].messagesSent = stats.connectionsByProtocol[proto].messagesSent + data.stats.messagesSent
-        stats.connectionsByProtocol[proto].messagesReceived = stats.connectionsByProtocol[proto].messagesReceived + data.stats.messagesReceived
-        stats.connectionsByProtocol[proto].errors = stats.connectionsByProtocol[proto].errors + data.stats.errors
-
-        stats.totalBytesSent = stats.totalBytesSent + data.stats.bytesSent
-        stats.totalBytesReceived = stats.totalBytesReceived + data.stats.bytesReceived
-        stats.totalMessagesSent = stats.totalMessagesSent + data.stats.messagesSent
-        stats.totalMessagesReceived = stats.totalMessagesReceived + data.stats.messagesReceived
-        stats.totalErrors = stats.totalErrors + data.stats.errors
-    end
-
-    if self.logger then
-        self.logger:debug("Statistics: %d connections, %d bytes sent, %d bytes received, %d errors",
-                stats.totalConnections, stats.totalBytesSent, stats.totalBytesReceived, stats.totalErrors)
-    end
-
-    return stats
-end
-
-function ConnectionManager:resetStats(connId)
-    if connId then
-        local connectionData = self.connections[connId]
-        if connectionData then
-            connectionData.stats = {
-                bytesSent = 0,
-                bytesReceived = 0,
-                messagesSent = 0,
-                messagesReceived = 0,
-                errors = 0
-            }
-
-            if self.logger then
-                self.logger:debug("Reset statistics for connection %s", connId)
-            end
-
-            return true
-        else
-            return false, error("Connection ID not found")
-        end
-    else
-        for _, data in pairs(self.connections) do
-            data.stats = {
-                bytesSent = 0,
-                bytesReceived = 0,
-                messagesSent = 0,
-                messagesReceived = 0,
-                errors = 0
-            }
         end
 
         if self.logger then
-            self.logger:debug("Reset statistics for all connections")
+            self.logger:debug("Connection monitor started")
         end
-
-        return true
     end
 end
 
-function ConnectionManager:executeProtocolAction(connId, action, ...)
-    local connectionData = self.connections[connId]
-    if not connectionData then
-        local err = "Connection ID not found"
-        if self.logger then self.logger:error("ExecuteProtocolAction failed: %s", err) end
-        return false, error(err)
+function ConnectionManager:stopConnectionMonitor()
+    self.monitorRunning = false
+    if self.logger then
+        self.logger:debug("Connection monitor stopped")
+    end
+end
+
+function ConnectionManager:cleanup()
+    -- Disconnect all connections
+    for id, _ in pairs(self.connections) do
+        self:disconnect(id)
     end
 
-    local conn = connectionData.connection
-    local protocol = connectionData.protocol
+    -- Stop monitor
+    self:stopConnectionMonitor()
 
     if self.logger then
-        self.logger:debug("Executing action '%s' on %s connection %s", action, protocol, connId)
+        self.logger:info("ConnectionManager cleaned up")
+    end
+end
+
+-- UDP-specific helper functions
+function ConnectionManager:createUDPSocket(port, options)
+    return self:createConnection("udp", port or 0, options)
+end
+
+function ConnectionManager:sendUDPDatagram(destIP, destPort, data, sourcePort)
+    -- Create temporary socket for one-off sends
+    local connId = self:createUDPSocket(sourcePort)
+    local success, result = self:send(connId, data, destIP, destPort)
+    self:disconnect(connId)
+    return success, result
+end
+
+function ConnectionManager:listenUDP(port, callback, options)
+    local connId = self:createUDPSocket(port, options)
+    local conn = self.connections[connId]
+
+    if not conn then
+        return nil, "Failed to create UDP socket"
     end
 
-    if conn[action] then
-        return conn[action](conn, ...)
-    else
-        return false, error(string.format("Action '%s' not supported for protocol '%s'", action, protocol))
+    -- Bind to port
+    local success, result = self:connect(connId)
+    if not success then
+        return nil, result
     end
+
+    -- Set up receive callback if provided
+    if callback and conn.connection.setReceiveCallback then
+        conn.connection:setReceiveCallback(callback)
+    end
+
+    return connId
 end
 
 return ConnectionManager
