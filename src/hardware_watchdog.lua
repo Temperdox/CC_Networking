@@ -1,7 +1,8 @@
 -- hardware_watchdog.lua
 -- Hardware monitoring daemon that detects peripheral changes and manages network services
+-- Version 1.0.2 - Enhanced with global stop signal support for cleaning up multiple netd instances
 
-local WATCHDOG_VERSION = "1.0.1"
+local WATCHDOG_VERSION = "1.0.2"
 local PID_FILE = "/var/run/hardware_watchdog.pid"
 local LOG_FILE = "logs/hardware_watchdog.log"
 local CHECK_INTERVAL = 5 -- seconds
@@ -81,15 +82,15 @@ local function isProcessRunning(processName)
     return fs.exists(pidFile)
 end
 
+local function isNetdRunning()
+    return fs.exists("/var/run/netd.pid")
+end
+
 local function killProcess(processName)
     local pidFile = "/var/run/" .. processName .. ".pid"
 
     -- First try to send terminate signal
     logInfo("Attempting to stop " .. processName)
-
-    -- In ComputerCraft, we can't directly kill a process, but we can:
-    -- 1. Delete the PID file to signal the process to stop
-    -- 2. Wait for it to clean up
 
     if fs.exists(pidFile) then
         -- Read PID before deleting
@@ -105,10 +106,6 @@ local function killProcess(processName)
             logInfo("Created stop signal for " .. processName)
         end
 
-        -- Delete PID file
-        fs.delete(pidFile)
-        logInfo("Removed " .. processName .. " PID file")
-
         -- Wait for process to stop
         local maxWait = 10 -- seconds
         local waited = 0
@@ -116,7 +113,7 @@ local function killProcess(processName)
             sleep(0.5)
             waited = waited + 0.5
 
-            -- Check if process created a new PID file (still running)
+            -- Check if process stopped (PID file removed)
             if not fs.exists(pidFile) then
                 logSuccess(processName .. " stopped successfully")
 
@@ -134,6 +131,11 @@ local function killProcess(processName)
         if fs.exists(stopFile) then
             fs.delete(stopFile)
         end
+        -- Force remove PID file
+        if fs.exists(pidFile) then
+            fs.delete(pidFile)
+            logWarning("Forcefully removed " .. processName .. " PID file")
+        end
     else
         logInfo("No PID file found for " .. processName)
     end
@@ -141,8 +143,43 @@ local function killProcess(processName)
     return false
 end
 
-local function isNetdRunning()
-    return isProcessRunning("netd")
+-- Kill all netd processes (including orphaned ones without PID files)
+local function killAllNetdProcesses()
+    logInfo("Cleaning up all netd processes...")
+
+    -- First, try the normal shutdown via PID file
+    if fs.exists("/var/run/netd.pid") then
+        killProcess("netd")
+    end
+
+    -- Create a global stop signal that all netd instances should check
+    local globalStopFile = "/var/run/netd.stop.all"
+    local f = fs.open(globalStopFile, "w")
+    if f then
+        f.write(tostring(os.epoch("utc")))
+        f.close()
+        logInfo("Created global stop signal for all netd instances")
+    end
+
+    -- Wait for processes to clean up
+    sleep(3) -- Give more time for all instances to see the signal
+
+    -- Clean up the stop file
+    if fs.exists(globalStopFile) then
+        fs.delete(globalStopFile)
+        logInfo("Removed global stop signal")
+    end
+
+    -- Remove any stale PID files
+    if fs.exists("/var/run/netd.pid") then
+        fs.delete("/var/run/netd.pid")
+        logInfo("Removed stale netd PID file")
+    end
+
+    -- Clean up any remaining stop signals
+    if fs.exists("/var/run/netd.stop") then
+        fs.delete("/var/run/netd.stop")
+    end
 end
 
 local function getCurrentPeripherals()
@@ -206,12 +243,11 @@ end
 local function restartNetd(reason)
     logWarning("Restarting netd: " .. reason)
 
-    -- First, properly stop the existing netd
-    if isNetdRunning() then
-        logInfo("Stopping existing netd process...")
-        killProcess("netd")
-        sleep(1) -- Give it time to clean up
-    end
+    -- Kill ALL netd processes, not just the one with PID file
+    killAllNetdProcesses()
+
+    -- Wait a bit to ensure cleanup
+    sleep(1)
 
     -- Now start a new instance
     logInfo("Starting new netd instance...")
@@ -247,6 +283,7 @@ local function handleModemChange(change_type, side, ptype)
         else
             logInfo("Starting netd - modem now available")
             shell.run("bg", "/bin/netd.lua")
+            sleep(1)
         end
 
     elseif change_type == "removed" then

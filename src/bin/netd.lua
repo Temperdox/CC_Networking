@@ -1,12 +1,24 @@
 -- /bin/netd.lua (quiet console + buffered file logging)
 -- Network daemon for ComputerCraft
+-- Updated with global stop signal support
 
-local version, daemon_name = "1.0.0", "netd"
+local version, daemon_name = "1.0.1", "netd"
 print("[netd] Starting Network Daemon v" .. version)
 
 -- already running?
 if fs.exists("/var/run/netd.pid") then
     local f = fs.open("/var/run/netd.pid","r"); if f then local pid=f.readAll(); f.close(); print("[netd] Already running (PID: "..pid..")"); return end
+end
+
+-- Check for stop signals at startup
+if fs.exists("/var/run/netd.stop.all") then
+    print("[netd] Global stop signal present - not starting")
+    return
+end
+if fs.exists("/var/run/netd.stop") then
+    print("[netd] Stop signal present - cleaning up and not starting")
+    fs.delete("/var/run/netd.stop")
+    return
 end
 
 -- load config
@@ -111,7 +123,7 @@ local function loadState()
     network_state.route_cache=network_state.route_cache or {}
     network_state.connections=network_state.connections or {}
     network_state.servers=network_state.servers or {}
-    network_state.stats=network_state.stats or { packets_sent=0, packets_received=0, bytes_sent=0, bytes_received=0, errors=0, uptime=0 }
+    network_state.stats=network_state.stats or { packets_sent=0, packets_received=0, bytes_sent=0, bytes_received=0, errors=0, uptime=0, dns_queries=0, arp_requests=0, http_requests=0, websocket_connections=0 }
 end
 
 local function saveState()
@@ -183,6 +195,7 @@ end
 
 local function handleDNS(sender,message)
     if type(message) ~= "table" then return end
+    network_state.stats.dns_queries = network_state.stats.dns_queries + 1
     if message.type=="query" and message.hostname then
         if message.hostname==cfg.hostname or message.hostname==cfg.fqdn or message.hostname=="localhost" then
             local resp={ type="response", hostname=message.hostname, ip=(message.hostname=="localhost" and "127.0.0.1" or cfg.ipv4), ttl=(cfg.cache and cfg.cache.dns_ttl or 300) }
@@ -201,6 +214,7 @@ end
 
 local function handleARP(sender,message)
     if type(message) ~= "table" then return end
+    network_state.stats.arp_requests = network_state.stats.arp_requests + 1
     if message.type=="request" and message.ip==cfg.ipv4 then
         rednet.send(sender,{type="reply", ip=cfg.ipv4, mac=cfg.mac, hostname=cfg.hostname}, cfg.arp_proto); logger:debug("Answered ARP request from %d", sender)
     elseif message.type=="reply" and message.ip and message.mac then
@@ -213,6 +227,7 @@ end
 local function handleHTTP(sender,message)
     if type(message) ~= "table" then return end
     if message.type=="request" or message.type=="http_request" then
+        network_state.stats.http_requests = network_state.stats.http_requests + 1
         local server = network_state.servers[message.port]; local response
         if server and server.handler then
             logger:debug("HTTP %s %s", message.method, message.path)
@@ -222,16 +237,20 @@ local function handleHTTP(sender,message)
             response={code=404, body="Not Found", headers={}}
         end
         local pkt={ type="response", id=message.id, code=response.code or 200, headers=response.headers or {}, body=response.body or "", timestamp=os.epoch("utc") }
-        rednet.send(sender, pkt, cfg.http_proto); network_state.stats.packets_sent = network_state.stats.packets_sent + 1
+        rednet.send(sender, pkt, cfg.http_proto);
+        network_state.stats.packets_sent = network_state.stats.packets_sent + 1
+        network_state.stats.bytes_sent = network_state.stats.bytes_sent + #textutils.serialize(pkt)
     elseif message.type=="response" or message.type=="http_response" then
         logger:trace("HTTP response %d from %d", message.code or 0, sender)
     end
     network_state.stats.packets_received = network_state.stats.packets_received + 1
+    network_state.stats.bytes_received = network_state.stats.bytes_received + #textutils.serialize(message)
 end
 
 local function handleWebSocket(sender,message)
     if type(message) ~= "table" then return end
     if message.type=="connect" or message.type=="ws_connect" then
+        network_state.stats.websocket_connections = network_state.stats.websocket_connections + 1
         local server = network_state.servers[message.url and message.url.port or 8080]
         if server and server.ws_handler then
             rednet.send(sender,{type="accept", connectionId=message.connectionId, timestamp=os.epoch("utc")}, cfg.ws_proto)
@@ -289,6 +308,21 @@ local function mainLoop()
     local tick = os.startTimer(1)
 
     while network_state.running do
+        -- Check for stop signals at the beginning of each loop iteration
+        if fs.exists("/var/run/netd.stop.all") then
+            logger:warn("Global stop signal detected - shutting down")
+            network_state.running = false
+            -- Don't delete the file here, let watchdog clean it up
+            break
+        end
+
+        if fs.exists("/var/run/netd.stop") then
+            logger:info("Stop signal detected - shutting down")
+            network_state.running = false
+            fs.delete("/var/run/netd.stop")
+            break
+        end
+
         local ev = { os.pullEvent() }
         if ev[1]=="rednet_message" then
             local sender,msg,proto = ev[2], ev[3], ev[4]
@@ -307,6 +341,15 @@ local function mainLoop()
         elseif ev[1]=="timer" then
             if ev[2]==tick then
                 local now=os.epoch("utc")
+
+                -- Periodic check for stop signals
+                if now % 5000 < 1000 then  -- Check every 5 seconds
+                    if fs.exists("/var/run/netd.stop.all") or fs.exists("/var/run/netd.stop") then
+                        logger:info("Stop signal detected during timer check")
+                        network_state.running = false
+                    end
+                end
+
                 if cfg.services and cfg.services.discovery and cfg.services.discovery.enabled and rednet.isOpen() and now>=next_bcast then
                     broadcastPresence(); next_bcast = now + (cfg.services.discovery.interval*1000)
                 end
