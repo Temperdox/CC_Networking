@@ -1,242 +1,178 @@
--- startup.lua (quiet + buffered logging)
--- ComputerCraft startup file with comprehensive logging
+-- startup.lua
+-- Boots network services unless netinst.cfg says to hand off to installer.
+-- - Honors start_background_processes flag in netinst.cfg
+-- - Starts daemons (netd, hardware_watchdog) safely (MultiShell if available)
+-- - Avoids duplicate starts by checking PID files
+-- - Logs to logs/startup.log
+-- - Optionally runs user_startup.lua at the end
 
--- Startup configuration
-local STARTUP_CONFIG = {
-    enableNetd = true,
-    enableLogger = false,       -- when false, logging won't spam the console
-    netdBackground = true,
-    hardwareWatchdog = true,
-    showNetInfo = true,
-    startupDelay = 0.5,
-    consoleMinLevel = "WARN",   -- only WARN/ERROR/CRITICAL print to screen
-    flushInterval = 0.5,        -- seconds between log flushes
-}
+local STARTUP_LOG = "logs/startup.log"
+local CFG_PATH    = "netinst.cfg"
 
--- map severities
-local LEVELS = { TRACE=1, DEBUG=2, INFO=3, SUCCESS=3, WARN=4, ERROR=5, CRITICAL=6 }
-local function sev(name) return LEVELS[(name or "INFO"):upper()] or 3 end
-
--- buffered logger (file)
-local LOG_DIR, LOG_PATH = "logs", "logs/startup.log"
-local _buf, _timer = {}, nil
-
-local function flushLog()
-    if #_buf == 0 then return end
-    if not fs.exists(LOG_DIR) then fs.makeDir(LOG_DIR) end
-    local f = fs.open(LOG_PATH, "a")
-    if f then
-        for i=1,#_buf do f.writeLine(_buf[i]) end
-        f.close()
-    end
-    _buf = {}
-end
-
-local function queueFlush()
-    if _timer then os.cancelTimer(_timer) end
-    _timer = os.startTimer(STARTUP_CONFIG.flushInterval)
-end
-
-local function writeLog(message, level)
-    level = (level or "INFO"):upper()
+-- ---------- tiny utils ----------
+local function log(msg)
     local ts = os.date("%Y-%m-%d %H:%M:%S")
-    local line = string.format("[%s] [%s] %s", ts, level, message)
+    local line = ("[%s] %s"):format(ts, msg)
+    print(line)
+    local dir = fs.getDir(STARTUP_LOG)
+    if dir ~= "" and not fs.exists(dir) then fs.makeDir(dir) end
+    local f = fs.open(STARTUP_LOG, "a")
+    if f then f.writeLine(line); f.close() end
+end
 
-    -- console: only show >= consoleMinLevel OR if enableLogger=true
-    if STARTUP_CONFIG.enableLogger or sev(level) >= sev(STARTUP_CONFIG.consoleMinLevel) then
-        print(line)
+local function readCfg()
+    if not fs.exists(CFG_PATH) then
+        return { start_background_processes = true }
     end
-
-    table.insert(_buf, line)
-    queueFlush()
+    local ok, cfg = pcall(function() return dofile(CFG_PATH) end)
+    if not ok or type(cfg) ~= "table" then
+        return { start_background_processes = true }
+    end
+    if cfg.start_background_processes == nil then
+        cfg.start_background_processes = true
+    end
+    return cfg
 end
 
-local function logError(msg, err) writeLog(msg .. (err and (" - "..tostring(err)) or ""), "ERROR") end
-local function logSuccess(msg)     writeLog(msg, "SUCCESS") end
-local function logInfo(msg)        writeLog(msg, "INFO") end
-local function logWarn(msg)        writeLog(msg, "WARN") end
-
--- Print startup banner (kept minimal)
-local function printBanner()
-    term.clear() term.setCursorPos(1,1)
-    print("=====================================")
-    print(" ComputerCraft Network System v1.0")
-    print("=====================================")
-    print()
-    logInfo("System startup initiated - Computer ID: " .. os.getComputerID())
+local function writeCfg(cfg)
+    local ok, ser = pcall(textutils.serialize, cfg)
+    if not ok then return false end
+    local f = fs.open(CFG_PATH, "w")
+    if not f then return false end
+    f.write("return " .. ser)
+    f.close()
+    return true
 end
 
-local function fileExists(path)
-    local exists = fs.exists(path)
-    logInfo("File check: " .. path .. " - " .. (exists and "EXISTS" or "NOT FOUND"))
-    return exists
+local function banner()
+    term.setTextColor(colors.cyan)
+    print("CC Network System Startup")
+    print("=========================")
+    term.setTextColor(colors.white)
 end
 
-local function createDirectories()
-    logInfo("Creating required directories...")
-    local dirs = {"/etc","/bin","/lib","/var","/var/log","/var/run","/var/cache","/logs","/protocols"}
-    local created = 0
-    for _,d in ipairs(dirs) do
-        if not fs.exists(d) then
-            local ok, e = pcall(function() fs.makeDir(d) end)
-            if ok then logInfo("Created directory: "..d); created = created + 1
-            else logError("Failed to create directory: "..d, e) end
+-- ---------- PID helpers ----------
+local function pidPath(name) return "/var/run/" .. name .. ".pid" end
+
+local function isRunning(name)
+    local p = pidPath(name)
+    if not fs.exists(p) then return false end
+    -- Treat any existing PID file as "running" – daemons manage their own lifecycle.
+    return true
+end
+
+local function ensureRuntimeDirs()
+    local dirs = {
+        "logs", "var", "var/run", "var/lib", "var/lib/dhcp",
+        "var/log", "var/cache", "usr", "usr/lib", "usr/lib/router"
+    }
+    for _, d in ipairs(dirs) do
+        if not fs.exists(d) then pcall(fs.makeDir, d) end
+    end
+end
+
+-- ---------- launcher ----------
+local function launchTabOrRun(title, program, ...)
+    -- Prefer MultiShell tabs (non-blocking). Fallback to foreground run (blocking).
+    if multishell and fs.exists(program) then
+        local env = _ENV
+        local tabID = multishell.launch(env, program, ...)
+        if tabID then
+            pcall(multishell.setTitle, tabID, title)
+            return true, ("launched tab #%d"):format(tabID)
         end
     end
-    logSuccess("Directory creation complete - " .. created .. " directories created")
-end
-
-local function setupNetworkConfig()
-    logInfo("Setting up network configuration...")
-    local configPath = "/etc/network.cfg"
-    local persistPath = "/etc/network.persistent"
-
-    if fileExists(persistPath) then
-        logInfo("Loading persistent network configuration...")
-        local ok, e = pcall(function()
-            local file = fs.open(persistPath, "r"); if not file then return end
-            local data = file.readAll(); file.close()
-            local cfgFile = fs.open(configPath, "w"); if not cfgFile then return end
-            cfgFile.write(data); cfgFile.close()
-            logSuccess("Network configuration loaded from persistent storage")
-        end)
-        if not ok then logError("Failed to load persistent configuration", e) end
+    -- Fallback: run in the same shell (blocking). Use separate shell to avoid clobber?
+    -- We run in a new tab only if multishell available; otherwise we just run and return.
+    if fs.exists(program) then
+        -- Spawn via parallel to avoid blocking the remainder of startup.
+        local args = { ... }
+        parallel.waitForAny(function()
+            shell.run(program, table.unpack(args))
+        end, function() sleep(0) end)
+        return true, "started (no multishell)"
     end
+    return false, "program not found"
+end
 
-    if not fileExists(configPath) then
-        logInfo("Generating new network configuration...")
-        local computerId = os.getComputerID()
-        local label = os.getComputerLabel() or ""
-        local ok, e = pcall(function()
-            local cfg = string.format([[
--- Auto-generated network configuration
--- Computer ID: %d
--- Generated: %s
-
-local config = {}
-config.id = %d
-config.label = "%s"
-config.modem_side = "auto"
-config.proto = "ccnet"
-config.mac = "%s"
-config.ipv4 = "%s"
-config.hostname = "%s"
-config.domain = "local"
-config.fqdn = config.hostname .. "." .. config.domain
-
-return config
-]],
-                    computerId, os.date(), computerId, label,
-                    string.format("CC:AF:%02X:%02X:%02X:%02X",
-                            bit.band(bit.brshift(computerId,24),0xFF) or 0,
-                            bit.band(bit.brshift(computerId,16),0xFF) or 0,
-                            bit.band(bit.brshift(computerId, 8),0xFF) or 0,
-                            bit.band(computerId,0xFF) or 0),
-                    string.format("10.0.%d.%d", math.floor(computerId/254)%256, (computerId%254)+1),
-                    (label ~= "" and (label:lower():gsub("[^%w%-]","") .. "-" .. computerId) or ("cc-"..computerId))
-            )
-            local f = fs.open(configPath, "w"); if not f then return end
-            f.write(cfg); f.close()
-            local p = fs.open(persistPath, "w"); if p then p.write(cfg); p.close() end
-            logSuccess("Network configuration generated successfully")
-        end)
-        if not ok then logError("Failed to generate network configuration", e); return false end
+local function startDaemon(name, program, ...)
+    -- Respect existing PID
+    if isRunning(name) then
+        log(("[%s] already running (PID file present)"):format(name))
+        return true
     end
-    return fileExists(configPath)
-end
-
-local function startNetd()
-    logInfo("Starting network daemon...")
-    if not fileExists("/bin/netd.lua") then logError("Network daemon not found", "/bin/netd.lua missing"); return false end
-    if fileExists("/var/run/netd.pid") then logInfo("Network daemon appears to be already running"); return true end
-    local ok, e = pcall(function()
-        if STARTUP_CONFIG.netdBackground then shell.run("bg", "/bin/netd.lua")
-        else shell.run("/bin/netd.lua") end
-    end)
-    if not ok then logError("Failed to start network daemon", e); return false end
-    logSuccess("Network daemon startup completed")
-    return true
-end
-
-local function startHardwareWatchdog()
-    if not fileExists("hardware_watchdog.lua") then logWarn("hardware_watchdog not found at hardware_watchdog.lua"); return false end
-    if fileExists("/var/run/hardware_watchdog.pid") then logInfo("hardware_watchdog appears to be already running"); return true end
-    local ok, e = pcall(function()
-        if STARTUP_CONFIG.hardwareWatchdog then shell.run("bg", "hardware_watchdog.lua")
-        else shell.run("hardware_watchdog.lua") end
-    end)
-    if not ok then logError("Failed to start Hardware watchdog daemon", e); return false end
-    logSuccess("Hardware watchdog daemon startup completed")
-    return true
-end
-
-local function showNetworkInfo()
-    logInfo("Displaying network information...")
-    local configPath = "/etc/network.cfg"
-    if fileExists(configPath) then
-        local ok, e = pcall(function()
-            local cfg = dofile(configPath)
-            if cfg then
-                print(); print("Network Information:")
-                print("  Computer ID: " .. cfg.id)
-                print("  Hostname:    " .. cfg.hostname)
-                print("  IP Address:  " .. cfg.ipv4)
-                print("  MAC Address: " .. cfg.mac); print()
-                logInfo("Network information displayed successfully")
-            else
-                logError("Failed to load network configuration for display", "Config returned nil")
-            end
-        end)
-        if not ok then logError("Failed to display network information", e) end
+    local ok, why = launchTabOrRun(name, program, ...)
+    if ok then
+        log(("Started %s (%s)"):format(name, why))
     else
-        logError("Cannot display network info", "Configuration file not found")
+        log(("Failed to start %s: %s"):format(name, why or "unknown"))
     end
+    return ok
 end
 
-local function runUserStartup()
-    if fileExists("/user_startup.lua") then
-        logInfo("Running user startup script...")
-        local t0 = os.epoch("utc")
-        local ok, e = pcall(function() shell.run("/user_startup.lua") end)
-        local dt = os.epoch("utc") - t0
-        if ok then logSuccess("User startup completed successfully in " .. dt .. "ms")
-        else logError("User startup failed", e) end
-    else
-        logInfo("No user startup script found - skipping")
-    end
-end
-
+-- ---------- main ----------
 local function main()
-    printBanner()
-    logInfo("System Information:")
-    logInfo("  ComputerCraft Version: " .. (_HOST or "Unknown"))
-    logInfo("  Computer ID: " .. os.getComputerID())
-    logInfo("  Computer Label: " .. (os.getComputerLabel() or "None"))
-    logInfo("  Startup Configuration: " .. textutils.serialize(STARTUP_CONFIG))
+    term.clear(); term.setCursorPos(1,1)
+    banner()
 
-    createDirectories()
-    local okCfg = setupNetworkConfig()
-    if STARTUP_CONFIG.startupDelay > 0 then logInfo("Waiting " .. STARTUP_CONFIG.startupDelay .. " seconds before starting services..."); sleep(STARTUP_CONFIG.startupDelay) end
-    local ok = okCfg
-    if STARTUP_CONFIG.enableNetd and ok then ok = startNetd() or ok end
-    if STARTUP_CONFIG.showNetInfo then showNetworkInfo() end
-    if STARTUP_CONFIG.hardwareWatchdog then startHardwareWatchdog() end
-    runUserStartup()
+    ensureRuntimeDirs()
 
-    if ok then logSuccess("System startup completed successfully"); print("Startup complete!")
-    else logWarn("System startup completed with errors - check logs/startup.log"); print("Startup complete with errors - check logs/startup.log") end
-    print()
+    local cfg = readCfg()
 
-    -- drain any pending flush timer before exiting
-    if _timer then
-        while true do
-            local ev, id = os.pullEvent()
-            if ev == "timer" and id == _timer then flushLog(); _timer = nil; break end
+    if cfg.start_background_processes == false then
+        -- Handshake: startup is intentionally paused for a clean installer run.
+        log("[startup] start_background_processes=false -> chaining to install.lua")
+        if fs.exists("install.lua") then
+            -- Run installer in foreground. It will flip the flag back to true.
+            shell.run("install.lua")
+        else
+            log("ERROR: install.lua not found; cannot continue clean install")
+            print("Press any key to continue")
+            os.pullEvent("key")
         end
-    else
-        flushLog()
+        return
     end
+
+    -- Normal boot path: start background services
+    log("Starting background services...")
+
+    -- netd (network daemon)
+    if fs.exists("bin/netd.lua") then
+        startDaemon("netd", "bin/netd.lua")
+    elseif fs.exists("netd.lua") then
+        startDaemon("netd", "netd.lua")
+    else
+        log("[netd] not found; skipping")
+    end
+
+    -- hardware_watchdog
+    if fs.exists("hardware_watchdog.lua") then
+        startDaemon("hardware_watchdog", "hardware_watchdog.lua")
+    else
+        log("[hardware_watchdog] not found; skipping")
+    end
+
+    -- You can add more here, e.g. routerd, web_admin, etc.
+    -- Example:
+    -- if fs.exists("bin/routerd.lua") then startDaemon("routerd", "bin/routerd.lua") end
+
+    log("Background services launch attempted.")
+
+    -- Optional: run user_startup.lua last, if present
+    if fs.exists("user_startup.lua") then
+        log("Running user_startup.lua...")
+        local ok, err = pcall(function() shell.run("user_startup.lua") end)
+        if not ok then log("user_startup.lua error: " .. tostring(err)) end
+    end
+
+    log("Startup sequence complete.")
 end
 
 local ok, err = pcall(main)
-if not ok then writeLog("CRITICAL: Startup failed completely: " .. tostring(err), "CRITICAL"); print("CRITICAL STARTUP FAILURE - Check logs/startup.log"); print("Error: " .. tostring(err)); flushLog() end
+if not ok then
+    log("CRITICAL startup failure: " .. tostring(err))
+    print("CRITICAL startup failure: " .. tostring(err))
+    print("See " .. STARTUP_LOG)
+    print("Press any key to continue")
+    os.pullEvent("key")
+end
