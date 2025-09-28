@@ -1,4 +1,3 @@
-#!/usr/bin/env lua
 -- /bin/netd.lua
 -- Network daemon for ComputerCraft
 -- Provides network services and protocol handling
@@ -38,7 +37,7 @@ end
 
 local cfg = loadConfig()
 
--- Logger setup
+-- Logger setup with parallel writing
 local logger = {
     levels = {
         trace = 1,
@@ -49,8 +48,11 @@ local logger = {
     },
     current_level = 3,
     log_file = nil,
+    backup_log_file = nil,
     entries = {},
-    max_entries = 1000
+    max_entries = 1000,
+    log_queue = {},
+    logging_active = false
 }
 
 function logger:init()
@@ -64,31 +66,117 @@ function logger:init()
             fs.makeDir(log_dir)
         end
 
-        -- Open log file
+        -- Also ensure logs directory exists for consistency
+        if not fs.exists("logs") then
+            fs.makeDir("logs")
+        end
+
+        -- Open log files
         self.log_file = fs.open(cfg.logging.file, "a")
+        self.backup_log_file = fs.open("logs/netd.log", "a")
+    else
+        -- Even if logging is disabled in config, create basic logs directory and file
+        if not fs.exists("logs") then
+            fs.makeDir("logs")
+        end
+
+        -- Create basic log file
+        self.backup_log_file = fs.open("logs/netd.log", "a")
     end
+
+    -- Start parallel logging process
+    self.logging_active = true
+    self:startLogWriter()
+end
+
+function logger:startLogWriter()
+    -- Start the logging thread in parallel
+    parallel.waitForAny(function()
+        while self.logging_active do
+            if #self.log_queue > 0 then
+                -- Process queued log entries
+                local entries_to_write = {}
+
+                -- Batch up to 10 entries at once for efficiency
+                for i = 1, math.min(10, #self.log_queue) do
+                    table.insert(entries_to_write, table.remove(self.log_queue, 1))
+                end
+
+                -- Write to files
+                for _, entry in ipairs(entries_to_write) do
+                    if self.log_file then
+                        self.log_file.writeLine(entry)
+                        self.log_file.flush()
+                    end
+
+                    if self.backup_log_file then
+                        self.backup_log_file.writeLine(entry)
+                        self.backup_log_file.flush()
+                    end
+                end
+            else
+                -- No entries to write, sleep briefly
+                sleep(0.1)
+            end
+        end
+    end)
 end
 
 function logger:log(level, msg, ...)
     if self.levels[level] >= self.current_level then
-        local timestamp = os.date and os.date("%Y-%m-%d %H:%M:%S") or os.time()
+        local timestamp = os.date and os.date("%Y-%m-%d %H:%M:%S") or tostring(os.time())
         local formatted = string.format(msg, ...)
         local log_line = string.format("[%s] [%s] %s", timestamp, level:upper(), formatted)
 
-        -- Print to console
+        -- Print to console immediately (non-blocking)
         print(log_line)
 
-        -- Write to file
-        if self.log_file then
-            self.log_file.writeLine(log_line)
-            self.log_file.flush()
-        end
+        -- Queue for file writing (non-blocking)
+        table.insert(self.log_queue, log_line)
 
         -- Store in memory (limited)
-        table.insert(self.entries, log_line)
+        table.insert(self.entries, {
+            timestamp = timestamp,
+            level = level,
+            message = formatted
+        })
         if #self.entries > self.max_entries then
             table.remove(self.entries, 1)
         end
+
+        -- Prevent queue from growing too large
+        if #self.log_queue > 1000 then
+            -- Remove oldest entries if queue gets too full
+            for i = 1, 100 do
+                table.remove(self.log_queue, 1)
+            end
+        end
+    end
+end
+
+function logger:close()
+    -- Stop the logging thread
+    self.logging_active = false
+
+    -- Write any remaining queued entries
+    while #self.log_queue > 0 do
+        local entry = table.remove(self.log_queue, 1)
+        if self.log_file then
+            self.log_file.writeLine(entry)
+        end
+        if self.backup_log_file then
+            self.backup_log_file.writeLine(entry)
+        end
+    end
+
+    -- Close files
+    if self.log_file then
+        self.log_file.close()
+        self.log_file = nil
+    end
+    if self.backup_log_file then
+        self.backup_log_file.close()
+        self.backup_log_file = nil
     end
 end
 
@@ -735,16 +823,30 @@ local function shutdown()
     logger:info("%s stopped", daemon_name)
 end
 
--- Main execution
+-- Main execution with parallel logging
 local function main()
-    -- Initialize
+    -- Initialize network first
     initNetwork()
 
-    -- Handle termination
-    local success, err = pcall(mainLoop)
-    if not success then
-        logger:error("Main loop error: %s", err)
-    end
+    -- Run daemon with parallel logging
+    parallel.waitForAny(
+    -- Main daemon loop
+            function()
+                local success, err = pcall(mainLoop)
+                if not success then
+                    logger:error("Main loop error: %s", err)
+                end
+            end,
+
+    -- Parallel log writer (started in logger:init())
+            function()
+                -- The log writer is started in logger:init() via startLogWriter()
+                -- This parallel thread handles the actual file writing
+                while network_state.running and logger.logging_active do
+                    sleep(1) -- Keep this thread alive
+                end
+            end
+    )
 
     -- Cleanup
     shutdown()
