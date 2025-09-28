@@ -1,191 +1,216 @@
--- /user_startup.lua
--- User custom startup script - runs after main startup.lua
--- Add your custom initialization code here
+-- user_startup.lua
+-- User-customizable startup script with logging
+-- This file is executed after the main system startup
 
--- Example user startup configuration
-local USER_CONFIG = {
-    -- Auto-connect to network
-    auto_dhcp = true,
+-- Logging utility
+local function writeLog(message, level)
+    level = level or "INFO"
+    local timestamp = os.date("%Y-%m-%d %H:%M:%S")
+    local log_entry = string.format("[%s] [%s] %s", timestamp, level, message)
 
-    -- Auto-connect to WiFi
-    auto_wifi = false,
-    wifi_ssid = nil,
-    wifi_password = nil,
+    -- Print to console
+    print(log_entry)
 
-    -- Start services
-    start_services = {
-        web_server = false,
-        file_server = false,
-        chat_server = false
-    },
+    -- Ensure logs directory exists
+    if not fs.exists("logs") then
+        fs.makeDir("logs")
+    end
 
-    -- Custom aliases
-    aliases = {
-        ll = "ls -l",
-        net = "network_demo.lua",
-        wifi = "wifi_client.lua"
+    -- Write to user startup log
+    local log_file = fs.open("logs/user_startup.log", "a")
+    if log_file then
+        log_file.writeLine(log_entry)
+        log_file.close()
+    end
+end
+
+local function logError(message, error_details)
+    writeLog(message .. " - " .. tostring(error_details), "ERROR")
+end
+
+local function logSuccess(message)
+    writeLog(message, "SUCCESS")
+end
+
+local function logInfo(message)
+    writeLog(message, "INFO")
+end
+
+local function logWarning(message)
+    writeLog(message, "WARNING")
+end
+
+-- Safe execution wrapper
+local function safeExecute(func, description)
+    logInfo("Executing: " .. description)
+    local success, result = pcall(func)
+
+    if success then
+        logSuccess(description .. " completed successfully")
+        return true, result
+    else
+        logError(description .. " failed", result)
+        return false, result
+    end
+end
+
+-- Example user customizations with logging
+local function customizePrompt()
+    logInfo("Customizing shell prompt...")
+
+    -- Example: Change shell prompt
+    if shell and shell.setPath then
+        local current_path = shell.path()
+        shell.setPath(current_path .. ":/usr/local/bin")
+        logInfo("Added /usr/local/bin to shell path")
+    end
+
+    logSuccess("Prompt customization completed")
+end
+
+local function loadUserPrograms()
+    logInfo("Loading user programs...")
+
+    local user_programs = {
+        "/programs/custom_tool.lua",
+        "/programs/network_monitor.lua",
+        "/programs/auto_backup.lua"
     }
-}
 
--- Helper functions
-local function log(message)
-    print("[User Startup] " .. message)
-end
-
-local function fileExists(path)
-    return fs.exists(path)
-end
-
--- Auto DHCP configuration
-local function autoDHCP()
-    if USER_CONFIG.auto_dhcp and fileExists("/dhcp_client.lua") then
-        log("Running automatic DHCP configuration...")
-
-        -- Check if we already have an IP
-        if fileExists("/etc/network.cfg") then
-            local file = fs.open("/etc/network.cfg", "r")
-            local content = file.readAll()
-            file.close()
-
-            local cfg = loadstring(content)
-            if cfg then
-                local config = cfg()
-                if config.ip and config.ip ~= "" then
-                    log("Already configured with IP: " .. config.ip)
-                    return
-                end
-            end
-        end
-
-        -- Run DHCP client
-        shell.run("/dhcp_client.lua")
-    end
-end
-
--- Auto WiFi connection
-local function autoWiFi()
-    if USER_CONFIG.auto_wifi and USER_CONFIG.wifi_ssid then
-        log("Auto-connecting to WiFi: " .. USER_CONFIG.wifi_ssid)
-
-        -- Check for wireless modem
-        local hasWireless = false
-        local sides = {"top", "bottom", "left", "right", "front", "back"}
-
-        for _, side in ipairs(sides) do
-            if peripheral.isPresent(side) and peripheral.getType(side) == "modem" then
-                local modem = peripheral.wrap(side)
-                if modem.isWireless and modem.isWireless() then
-                    hasWireless = true
-                    break
-                end
-            end
-        end
-
-        if hasWireless and fileExists("/wifi_client.lua") then
-            -- Load WiFi client
-            local WiFiClient = dofile("/wifi_client.lua")
-            if WiFiClient then
-                local client = WiFiClient:new()
-                if client:findWirelessInterface() then
-                    local success, err = client:connect(
-                            USER_CONFIG.wifi_ssid,
-                            USER_CONFIG.wifi_password
-                    )
-
-                    if success then
-                        log("Successfully connected to WiFi")
-                    else
-                        log("WiFi connection failed: " .. (err or "unknown error"))
-                    end
-                end
-            end
+    local loaded_count = 0
+    for _, program in ipairs(user_programs) do
+        if fs.exists(program) then
+            safeExecute(function()
+                dofile(program)
+            end, "Load program: " .. program)
+            loaded_count = loaded_count + 1
         else
-            log("No wireless modem found for WiFi connection")
-        end
-    end
-end
-
--- Start custom services
-local function startServices()
-    for service, enabled in pairs(USER_CONFIG.start_services) do
-        if enabled then
-            local service_path = "/services/" .. service .. ".lua"
-            if fileExists(service_path) then
-                log("Starting service: " .. service)
-                shell.run("bg", service_path)
-            else
-                log("Service not found: " .. service)
-            end
-        end
-    end
-end
-
--- Set up aliases
-local function setupAliases()
-    for alias, command in pairs(USER_CONFIG.aliases) do
-        shell.setAlias(alias, command)
-        log("Added alias: " .. alias .. " -> " .. command)
-    end
-end
-
--- Custom initialization
-local function customInit()
-    -- Add your custom initialization code here
-
-    -- Example: Set computer label if not set
-    if not os.getComputerLabel() then
-        local id = os.getComputerID()
-        os.setComputerLabel("CC-" .. id)
-        log("Set computer label to: CC-" .. id)
-    end
-
-    -- Example: Create work directories
-    local dirs = {"/home", "/projects", "/downloads"}
-    for _, dir in ipairs(dirs) do
-        if not fs.exists(dir) then
-            fs.makeDir(dir)
-            log("Created directory: " .. dir)
+            logInfo("Optional program not found: " .. program)
         end
     end
 
-    -- Example: Show network info if available
-    if fileExists("/lib/network.lua") then
-        local network = dofile("/lib/network.lua")
-        if network and network.getInfo then
-            local info = network.getInfo()
-            if info then
-                print()
-                print("=== Network Information ===")
-                print("Hostname: " .. (info.hostname or "unknown"))
-                print("IP: " .. (info.ip or "not configured"))
-                print("MAC: " .. (info.mac or "unknown"))
-                print()
-            end
-        end
-    end
+    logSuccess("User programs loaded - " .. loaded_count .. " programs")
 end
 
--- Main execution
+local function setupUserServices()
+    logInfo("Setting up user services...")
+
+    -- Example: Start a custom service
+    safeExecute(function()
+        -- Custom service startup code here
+        logInfo("Custom service initialized")
+    end, "Custom service startup")
+
+    -- Example: Set up automatic tasks
+    safeExecute(function()
+        -- Schedule periodic tasks
+        logInfo("Periodic tasks scheduled")
+    end, "Task scheduler setup")
+
+    logSuccess("User services setup completed")
+end
+
+local function displayUserWelcome()
+    logInfo("Displaying user welcome message...")
+
+    print()
+    print("========== Welcome ==========")
+    print("Computer: " .. (os.getComputerLabel() or ("Computer " .. os.getComputerID())))
+    print("User startup completed successfully")
+    print("Time: " .. os.date("%Y-%m-%d %H:%M:%S"))
+    print("============================")
+    print()
+
+    logInfo("Welcome message displayed")
+end
+
+-- Main user startup function
 local function main()
-    log("Starting user initialization...")
+    local startup_begin = os.epoch("utc")
 
-    -- Run initialization steps
-    setupAliases()
-    autoDHCP()
-    autoWiFi()
-    startServices()
-    customInit()
+    logInfo("User startup initiated")
+    logInfo("User: " .. (os.getComputerLabel() or "Unknown"))
+    logInfo("Computer ID: " .. os.getComputerID())
 
-    log("User initialization complete")
+    local overall_success = true
 
-    -- Optional: Show a custom message
-    print()
-    print("=====================================")
-    print(" Welcome to ComputerCraft Network")
-    print(" Type 'help' for available commands")
-    print("=====================================")
-    print()
+    -- Customize shell and environment
+    local success = safeExecute(customizePrompt, "Shell customization")
+    if not success then overall_success = false end
+
+    -- Load user programs
+    success = safeExecute(loadUserPrograms, "User program loading")
+    if not success then overall_success = false end
+
+    -- Setup user services
+    success = safeExecute(setupUserServices, "User service setup")
+    if not success then overall_success = false end
+
+    -- Display welcome message
+    safeExecute(displayUserWelcome, "Welcome message display")
+
+    local startup_duration = os.epoch("utc") - startup_begin
+
+    if overall_success then
+        logSuccess("User startup completed successfully in " .. startup_duration .. "ms")
+    else
+        logWarning("User startup completed with some issues in " .. startup_duration .. "ms")
+    end
+
+    return overall_success
 end
 
--- Run main function
-main()
+-- Example of how users can add their own custom functions
+local function myCustomFunction()
+    logInfo("Running custom user function...")
+
+    -- User can add their custom startup code here
+    -- Examples:
+    -- - Start custom programs
+    -- - Configure network settings
+    -- - Set up monitoring
+    -- - Initialize hardware
+
+    logSuccess("Custom function completed")
+end
+
+-- Run user startup with comprehensive error handling
+logInfo("=== USER STARTUP BEGIN ===")
+
+local startup_success, startup_error = pcall(main)
+
+if not startup_success then
+    -- Critical startup failure
+    writeLog("CRITICAL: User startup failed completely: " .. tostring(startup_error), "CRITICAL")
+    print("CRITICAL USER STARTUP FAILURE")
+    print("Check logs/user_startup.log for details")
+    print("Error: " .. tostring(startup_error))
+else
+    -- Run any additional custom functions
+    pcall(myCustomFunction)
+end
+
+logInfo("=== USER STARTUP END ===")
+
+-- Template for users to copy and modify:
+--[[
+To customize this file:
+
+1. Add your custom functions before the main() function
+2. Call your functions from within main() using safeExecute()
+3. Use the logging functions to track what your code is doing:
+   - logInfo() for informational messages
+   - logSuccess() for successful operations
+   - logWarning() for non-critical issues
+   - logError() for serious problems
+
+Example:
+local function startMyProgram()
+    logInfo("Starting my custom program...")
+    shell.run("/programs/my_program.lua")
+    logSuccess("My program started")
+end
+
+Then call it from main():
+safeExecute(startMyProgram, "My custom program startup")
+--]]
