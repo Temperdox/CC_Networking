@@ -1,4 +1,3 @@
-#!/usr/bin/env lua
 -- test_server.lua
 -- Standalone HTTP test server - works independently of hardware_watchdog
 
@@ -313,6 +312,49 @@ local function main()
     else
         print("⚠ Network daemon (netd) is not running")
         print("  Server will use basic rednet mode")
+    end
+
+    -- Try to load network library (optional)
+    local network = nil
+    local network_error = nil
+    local ok = pcall(function()
+        network = require("lib.network")
+    end)
+
+    if ok and network then
+        print("✓ Network library loaded")
+
+        -- Try to get network info
+        local info_ok, info = pcall(network.getInfo)
+        if info_ok and info then
+            print("  IP: " .. (info.ip or "unknown"))
+            print("  Hostname: " .. (info.hostname or "unknown"))
+        end
+
+        -- Check if createServer exists and works
+        if network.createServer then
+            local test_ok, test_err = pcall(function()
+                -- Just test if the function exists and can be called
+                local test = network.createServer
+                return type(test) == "function"
+            end)
+
+            if not test_ok then
+                network_error = "createServer function error: " .. tostring(test_err)
+                logWarning("Network library HTTP server not available: " .. network_error)
+                print("⚠ Network library HTTP server not available")
+                print("  (Using rednet mode instead)")
+            end
+        else
+            network_error = "createServer function not found"
+            logInfo("Network library does not provide createServer")
+            print("ℹ Network library does not provide HTTP server")
+            print("  (Using rednet mode)")
+        end
+    else
+        logInfo("Network library not loaded - using standalone mode")
+        print("ℹ Network library not loaded")
+        print("  (Using standalone rednet mode)")
     end
 
     print()
