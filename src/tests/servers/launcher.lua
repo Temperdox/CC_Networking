@@ -2,7 +2,26 @@
 -- Test Server Launcher for ComputerCraft Network System
 -- Manages and launches various test servers with Basalt UI
 
-local basalt = require("basalt")
+-- ---- safeRequire: works with/without global `require`
+local function safeRequire(name)
+    if type(require) == "function" then
+        local ok, mod = pcall(require, name)
+        if ok and mod ~= nil then return mod end
+    end
+    local candidates = {
+        "/" .. name .. ".lua",
+        name .. ".lua",
+    }
+    for _, p in ipairs(candidates) do
+        if fs.exists(p) then
+            local ok, mod = pcall(dofile, p)
+            if ok and mod ~= nil then return mod end
+        end
+    end
+    error("safeRequire: cannot load module '" .. tostring(name) .. "'")
+end
+
+local basalt = safeRequire("basalt")
 
 local launcher = {}
 launcher.version = "1.0.0"
@@ -58,20 +77,18 @@ local function startServer(serverType)
     if not config then
         return false, "Unknown server type"
     end
-
     if config.status == "running" then
         return false, "Server already running"
     end
-
     if not fs.exists(config.file) then
         return false, "Server file not found: " .. config.file
     end
 
-    -- Load and start the server
+    -- Load and start the server (use dofile to keep global env)
     local ok, serverModule = pcall(dofile, config.file)
     if not ok then
-        log("Failed to load " .. config.name .. ": " .. serverModule, "ERROR")
-        return false, "Failed to load server: " .. serverModule
+        log("Failed to load " .. config.name .. ": " .. tostring(serverModule), "ERROR")
+        return false, "Failed to load server: " .. tostring(serverModule)
     end
 
     if serverModule and serverModule.start then
@@ -94,7 +111,6 @@ local function stopServer(serverType)
     if not config then
         return false, "Unknown server type"
     end
-
     if config.status == "stopped" then
         return false, "Server not running"
     end
@@ -119,19 +135,12 @@ end
 local function getServerStats(serverType)
     local config = serverConfigs[serverType]
     if not config or not config.instance then
-        return {
-            running = false,
-            error = "Server not available"
-        }
+        return { running = false, error = "Server not available" }
     end
-
     if config.instance.getStats then
         return config.instance.getStats()
     else
-        return {
-            running = config.status == "running",
-            message = "No statistics available"
-        }
+        return { running = config.status == "running", message = "No statistics available" }
     end
 end
 
@@ -139,20 +148,13 @@ end
 local main, statusLabel, logList
 
 local function updateServerStatus()
-    -- Update server status in UI
-    for serverType, config in pairs(serverConfigs) do
-        local statusText = string.format("%s: %s (Port %d)",
-                config.name, config.status, config.port)
-        -- Update UI elements (you'd need to track the specific labels)
-    end
+    -- (kept simple; add per-server labels if you want live status lines)
 end
 
 local function addLogMessage(message, color)
     if logList then
         logList:addItem(string.format("[%s] %s", os.date("%H:%M:%S"), message), color or colors.white)
-        if logList.scrollToBottom then
-            logList:scrollToBottom()
-        end
+        if logList.scrollToBottom then logList:scrollToBottom() end
     end
 end
 
@@ -171,7 +173,6 @@ local function createMainUI()
 
     local yPos = 3
     for serverType, config in pairs(serverConfigs) do
-        -- Server name and status
         controlPanel:addLabel():setPosition(1, yPos):setSize(20, 1)
                     :setText(config.name):setForeground(colors.black)
 
@@ -179,37 +180,27 @@ local function createMainUI()
         controlPanel:addLabel():setPosition(21, yPos):setSize(10, 1)
                     :setText(config.status):setForeground(statusColor)
 
-        -- Control buttons
         local startBtn = controlPanel:addButton():setPosition(32, yPos):setSize(6, 1)
                                      :setText("Start"):setBackground(colors.green):setForeground(colors.white)
-
-        local stopBtn = controlPanel:addButton():setPosition(39, yPos):setSize(6, 1)
-                                    :setText("Stop"):setBackground(colors.red):setForeground(colors.white)
-
+        local stopBtn  = controlPanel:addButton():setPosition(39, yPos):setSize(6, 1)
+                                     :setText("Stop"):setBackground(colors.red):setForeground(colors.white)
         local statsBtn = controlPanel:addButton():setPosition(46, yPos):setSize(6, 1)
                                      :setText("Stats"):setBackground(colors.orange):setForeground(colors.white)
 
-        -- Button event handlers
         startBtn:onClick(function()
-            local success, message = startServer(serverType)
-            local color = success and colors.green or colors.red
-            addLogMessage(config.name .. ": " .. message, color)
+            local ok, msg = startServer(serverType)
+            addLogMessage(config.name .. ": " .. msg, ok and colors.green or colors.red)
             updateServerStatus()
         end)
-
         stopBtn:onClick(function()
-            local success, message = stopServer(serverType)
-            local color = success and colors.green or colors.red
-            addLogMessage(config.name .. ": " .. message, color)
+            local ok, msg = stopServer(serverType)
+            addLogMessage(config.name .. ": " .. msg, ok and colors.green or colors.red)
             updateServerStatus()
         end)
-
         statsBtn:onClick(function()
-            local stats = getServerStats(serverType)
-            if stats.running then
-                local statsMsg = string.format("%s Stats - Uptime: %ds",
-                        config.name, stats.uptime or 0)
-                addLogMessage(statsMsg, colors.cyan)
+            local st = getServerStats(serverType)
+            if st.running then
+                addLogMessage(string.format("%s uptime: %ds", config.name, st.uptime or 0), colors.cyan)
             else
                 addLogMessage(config.name .. ": Not running", colors.yellow)
             end
@@ -221,38 +212,31 @@ local function createMainUI()
     -- Action buttons
     local startAllBtn = controlPanel:addButton():setPosition(1, yPos + 1):setSize(12, 1)
                                     :setText("Start All"):setBackground(colors.lime):setForeground(colors.black)
-
-    local stopAllBtn = controlPanel:addButton():setPosition(14, yPos + 1):setSize(12, 1)
-                                   :setText("Stop All"):setBackground(colors.pink):setForeground(colors.black)
-
-    local testBtn = controlPanel:addButton():setPosition(27, yPos + 1):setSize(12, 1)
-                                :setText("Run Tests"):setBackground(colors.cyan):setForeground(colors.black)
+    local stopAllBtn  = controlPanel:addButton():setPosition(14, yPos + 1):setSize(12, 1)
+                                    :setText("Stop All"):setBackground(colors.pink):setForeground(colors.black)
+    local testBtn     = controlPanel:addButton():setPosition(27, yPos + 1):setSize(12, 1)
+                                    :setText("Run Tests"):setBackground(colors.cyan):setForeground(colors.black)
 
     startAllBtn:onClick(function()
-        for serverType, _ in pairs(serverConfigs) do
-            local success, message = startServer(serverType)
-            local color = success and colors.green or colors.red
-            addLogMessage("Start " .. serverConfigs[serverType].name .. ": " .. message, color)
+        for k in pairs(serverConfigs) do
+            local ok, msg = startServer(k)
+            addLogMessage("Start " .. serverConfigs[k].name .. ": " .. msg, ok and colors.green or colors.red)
         end
         updateServerStatus()
     end)
-
     stopAllBtn:onClick(function()
-        for serverType, _ in pairs(serverConfigs) do
-            local success, message = stopServer(serverType)
-            local color = success and colors.green or colors.red
-            addLogMessage("Stop " .. serverConfigs[serverType].name .. ": " .. message, color)
+        for k in pairs(serverConfigs) do
+            local ok, msg = stopServer(k)
+            addLogMessage("Stop " .. serverConfigs[k].name .. ": " .. msg, ok and colors.green or colors.red)
         end
         updateServerStatus()
     end)
-
     testBtn:onClick(function()
         addLogMessage("Running server tests...", colors.yellow)
-        -- Run basic connectivity tests
-        for serverType, config in pairs(serverConfigs) do
-            if config.status == "running" and config.instance and config.instance.test then
-                config.instance.test()
-                addLogMessage(config.name .. " test completed", colors.green)
+        for _, cfg in pairs(serverConfigs) do
+            if cfg.status == "running" and cfg.instance and cfg.instance.test then
+                cfg.instance.test()
+                addLogMessage(cfg.name .. " test completed", colors.green)
             end
         end
     end)
@@ -260,111 +244,44 @@ local function createMainUI()
     -- Log panel
     local logPanel = main:addFrame():setPosition(2, 16):setSize(w-2, h-16):setBackground(colors.black)
     logPanel:addLabel():setPosition(1, 1):setText("Server Logs"):setForeground(colors.white)
-
     logList = logPanel:addList():setPosition(1, 2):setSize(w-2, h-18)
                       :setBackground(colors.black):setForeground(colors.white)
 
-    -- Exit button
+    -- Exit
     local exitBtn = main:addButton():setPosition(w-8, h):setSize(8, 1)
                         :setText("Exit"):setBackground(colors.red):setForeground(colors.white)
+    exitBtn:onClick(function() launcher.running = false end)
 
-    exitBtn:onClick(function()
-        launcher.running = false
-    end)
-
-    -- Initial log message
     addLogMessage("Server Launcher initialized", colors.lime)
     addLogMessage("Computer ID: " .. os.getComputerID(), colors.cyan)
-end
-
--- Network status check
-local function checkNetworkStatus()
-    local networkOk = true
-    local issues = {}
-
-    -- Check if netd is running
-    if not fs.exists("/var/run/netd.pid") then
-        table.insert(issues, "netd not running")
-        networkOk = false
-    end
-
-    -- Check if rednet is open
-    if not rednet.isOpen() then
-        table.insert(issues, "rednet not open")
-        networkOk = false
-    end
-
-    -- Check UDP protocol availability
-    if not _G.netd_udp and not fs.exists("/protocols/udp.lua") then
-        table.insert(issues, "UDP protocol not available")
-    end
-
-    return networkOk, issues
-end
-
--- Startup checks
-local function performStartupChecks()
-    addLogMessage("Performing startup checks...", colors.yellow)
-
-    -- Check network status
-    local networkOk, issues = checkNetworkStatus()
-    if networkOk then
-        addLogMessage("Network status: OK", colors.green)
-    else
-        addLogMessage("Network issues: " .. table.concat(issues, ", "), colors.red)
-    end
-
-    -- Check server files
-    local filesOk = true
-    for serverType, config in pairs(serverConfigs) do
-        if fs.exists(config.file) then
-            addLogMessage(config.name .. " file: OK", colors.green)
-        else
-            addLogMessage(config.name .. " file: MISSING (" .. config.file .. ")", colors.red)
-            filesOk = false
-        end
-    end
-
-    if filesOk and networkOk then
-        addLogMessage("All startup checks passed", colors.lime)
-    else
-        addLogMessage("Some startup checks failed - functionality may be limited", colors.orange)
-    end
 end
 
 -- Main execution
 local function main_loop()
     createMainUI()
-    performStartupChecks()
 
     while launcher.running do
-        local event = {os.pullEventRaw()}
-        basalt.update(table.unpack(event))
-
-        if event[1] == "terminate" then
-            -- Stop all servers before exiting
-            for serverType, _ in pairs(serverConfigs) do
-                if serverConfigs[serverType].status == "running" then
-                    stopServer(serverType)
-                end
+        local ev = { os.pullEventRaw() }
+        basalt.update(table.unpack(ev))
+        if ev[1] == "terminate" then
+            for k in pairs(serverConfigs) do
+                if serverConfigs[k].status == "running" then stopServer(k) end
             end
             launcher.running = false
         end
     end
 
-    -- Clean exit
     term.clear()
     term.setCursorPos(1, 1)
     print("Server Launcher exited.")
 end
 
--- Export functions for external use
-launcher.startServer = startServer
-launcher.stopServer = stopServer
-launcher.getServerStats = getServerStats
+-- Export + optional auto-run
+launcher.startServer   = startServer
+launcher.stopServer    = stopServer
+launcher.getServerStats= getServerStats
 launcher.serverConfigs = serverConfigs
 
--- Auto-start UI if run directly
 if not _G.server_launcher then
     _G.server_launcher = launcher
     main_loop()
