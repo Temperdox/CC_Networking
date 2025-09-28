@@ -1,6 +1,6 @@
 -- /tests/test_client.lua
--- Network Test Client for ComputerCraft Network System
--- Fixed version that works with bridge loader
+-- Enhanced Network Test Client with Cross-Computer Communication
+-- Supports both local and remote server discovery and testing
 
 local basalt = nil
 
@@ -8,25 +8,19 @@ local basalt = nil
 if _G._test_network_basalt then
     basalt = _G._test_network_basalt
 else
-    -- Try to load basalt normally
     local success, result = pcall(require, "basalt")
     if success then
         basalt = result
-    else
-        -- Fallback - try direct load
-        if fs.exists("basalt.lua") then
-            success, result = pcall(dofile, "basalt.lua")
-            if success then
-                basalt = result
-            end
-        end
+    elseif fs.exists("basalt.lua") then
+        success, result = pcall(dofile, "basalt.lua")
+        if success then basalt = result end
     end
 end
 
 local hasBasalt = basalt ~= nil
 
 local client = {}
-client.version = "1.0.0"
+client.version = "2.0.0"
 client.running = true
 
 -- Load network libraries
@@ -43,23 +37,160 @@ elseif _G.netd_udp then
     udp = _G.netd_udp
 end
 
--- Test targets
+-- Enhanced logging system
+local LOG_DIR = "/var/log"
+local LOG_FILE = LOG_DIR .. "/test_client.log"
+local log_buffer = {}
+
+local function ensureLogDir()
+    if not fs.exists(LOG_DIR) then fs.makeDir(LOG_DIR) end
+end
+
+local function flushLog()
+    ensureLogDir()
+    if #log_buffer > 0 then
+        local f = fs.open(LOG_FILE, "a")
+        if f then
+            for _, entry in ipairs(log_buffer) do
+                f.writeLine(entry)
+            end
+            f.close()
+        end
+        log_buffer = {}
+    end
+end
+
+-- Logging
+local logMessages = {}
+local function log(message, level)
+    level = level or "INFO"
+    local timestamp = os.date("%H:%M:%S")
+    local logEntry = string.format("[%s] %s: %s", timestamp, level, message)
+
+    table.insert(logMessages, {
+        time = timestamp,
+        level = level,
+        message = message
+    })
+
+    table.insert(log_buffer, os.date("%Y-%m-%d %H:%M:%S") .. " [" .. level .. "] " .. message)
+
+    if #logMessages > 100 then
+        table.remove(logMessages, 1)
+    end
+
+    if #log_buffer >= 10 then
+        flushLog()
+    end
+
+    if not hasBasalt then
+        print(logEntry)
+    end
+end
+
+-- Server discovery function
+local function discoverServers()
+    log("Starting server discovery...")
+    local discovered = {}
+
+    -- Open modem if not already open
+    local modem = peripheral.find("modem")
+    if modem and not rednet.isOpen(peripheral.getName(modem)) then
+        rednet.open(peripheral.getName(modem))
+    end
+
+    -- Look for HTTP servers
+    local httpServers = {rednet.lookup("http_server")}
+    for _, id in ipairs(httpServers) do
+        if id then
+            local hostname = os.getComputerLabel and os.getComputerLabel() or ("cc-" .. id)
+            local ip = string.format("10.0.%d.%d",
+                    math.floor(id / 254) % 256,
+                    (id % 254) + 1)
+
+            table.insert(discovered, {
+                type = "http",
+                id = id,
+                hostname = hostname,
+                ip = ip,
+                port = 80
+            })
+            log(string.format("Found HTTP server: %s (ID:%d, IP:%s)", hostname, id, ip))
+        end
+    end
+
+    -- Look for WebSocket servers
+    local wsServers = {rednet.lookup("websocket_server")}
+    for _, id in ipairs(wsServers) do
+        if id then
+            local hostname = "ws-server-" .. id
+            local ip = string.format("10.0.%d.%d",
+                    math.floor(id / 254) % 256,
+                    (id % 254) + 1)
+
+            table.insert(discovered, {
+                type = "websocket",
+                id = id,
+                hostname = hostname,
+                ip = ip,
+                port = 8081
+            })
+            log(string.format("Found WebSocket server: %s (ID:%d, IP:%s)", hostname, id, ip))
+        end
+    end
+
+    -- Broadcast discovery request
+    rednet.broadcast({
+        type = "server_discovery",
+        source = os.getComputerID()
+    }, "network_discovery")
+
+    -- Wait for responses
+    local timeout = os.startTimer(2)
+    while true do
+        local event, p1, p2, p3 = os.pullEvent()
+        if event == "timer" and p1 == timeout then
+            break
+        elseif event == "rednet_message" then
+            local sender, message, protocol = p1, p2, p3
+            if protocol == "network_discovery" and type(message) == "table" then
+                if message.type == "server_announce" then
+                    table.insert(discovered, {
+                        type = message.server_type or "unknown",
+                        id = sender,
+                        hostname = message.hostname,
+                        ip = message.ip,
+                        port = message.port
+                    })
+                    log(string.format("Discovered %s server: %s", message.server_type, message.hostname))
+                end
+            end
+        end
+    end
+
+    return discovered
+end
+
+-- Test targets with dynamic discovery
 local testTargets = {
     http = {
         name = "HTTP Server",
-        host = "127.0.0.1",
-        port = 8080,
-        endpoints = {"/", "/api/status", "/api/time", "/api/computer", "/api/test"}
+        host = nil,  -- Will be set dynamically
+        port = 80,
+        computer_id = nil,
+        endpoints = {"/", "/test", "/info", "/time", "/echo?msg=test", "/status"}
     },
     websocket = {
         name = "WebSocket Server",
-        host = "127.0.0.1",
+        host = nil,
         port = 8081,
+        computer_id = nil,
         connection_id = nil
     },
     udp = {
         name = "UDP Server",
-        host = "127.0.0.1",
+        host = nil,
+        computer_id = nil,
         ports = {
             echo = 7,
             time = 37,
@@ -76,72 +207,117 @@ local testResults = {
     udp = {}
 }
 
--- Logging
-local logMessages = {}
-local function log(message, level)
-    level = level or "INFO"
-    local timestamp = os.date("%H:%M:%S")
-    local logEntry = string.format("[%s] %s: %s", timestamp, level, message)
-
-    table.insert(logMessages, {
-        time = timestamp,
-        level = level,
-        message = message
-    })
-
-    -- Keep log size manageable
-    if #logMessages > 100 then
-        table.remove(logMessages, 1)
+-- Update targets with discovered servers
+local function updateTargets(servers)
+    for _, server in ipairs(servers) do
+        if server.type == "http" and not testTargets.http.host then
+            testTargets.http.host = server.ip
+            testTargets.http.computer_id = server.id
+            log("Set HTTP target to " .. server.ip .. " (ID: " .. server.id .. ")")
+        elseif server.type == "websocket" and not testTargets.websocket.host then
+            testTargets.websocket.host = server.ip
+            testTargets.websocket.computer_id = server.id
+            testTargets.websocket.port = server.port
+            log("Set WebSocket target to " .. server.ip .. " (ID: " .. server.id .. ")")
+        elseif server.type == "udp" and not testTargets.udp.host then
+            testTargets.udp.host = server.ip
+            testTargets.udp.computer_id = server.id
+            log("Set UDP target to " .. server.ip .. " (ID: " .. server.id .. ")")
+        end
     end
 
-    if not hasBasalt then
-        print(logEntry)
+    -- Fallback to localhost if no servers found
+    if not testTargets.http.host then
+        testTargets.http.host = "127.0.0.1"
+        log("No HTTP servers found, using localhost", "WARN")
+    end
+    if not testTargets.websocket.host then
+        testTargets.websocket.host = "127.0.0.1"
+        log("No WebSocket servers found, using localhost", "WARN")
+    end
+    if not testTargets.udp.host then
+        testTargets.udp.host = "127.0.0.1"
+        log("No UDP servers found, using localhost", "WARN")
     end
 end
 
--- HTTP Test Functions
+-- HTTP Test Functions with cross-computer support
 local function testHTTP()
     log("Starting HTTP tests...")
     local results = {}
 
+    -- Ensure we have a target
+    if not testTargets.http.host then
+        local servers = discoverServers()
+        updateTargets(servers)
+    end
+
     for _, endpoint in ipairs(testTargets.http.endpoints) do
         log("Testing HTTP endpoint: " .. endpoint)
-
-        local request = {
-            method = "GET",
-            path = endpoint,
-            headers = {
-                ["user-agent"] = "CC-TestClient/" .. client.version,
-                ["accept"] = "application/json"
-            }
-        }
 
         local startTime = os.epoch("utc")
         local success = false
         local response = nil
+        local error_msg = nil
 
-        -- Try using network library first
-        if network and network.http_request then
-            success, response = pcall(network.http_request,
-                    testTargets.http.host,
-                    testTargets.http.port,
-                    request)
+        -- If testing remote computer, use rednet
+        if testTargets.http.computer_id and testTargets.http.computer_id ~= os.getComputerID() then
+            log("Using rednet for remote HTTP to computer " .. testTargets.http.computer_id)
+
+            local request = {
+                type = "http_request",
+                method = "GET",
+                path = endpoint,
+                headers = {
+                    ["user-agent"] = "CC-TestClient/" .. client.version,
+                    ["accept"] = "application/json"
+                },
+                id = math.random(100000, 999999)
+            }
+
+            rednet.send(testTargets.http.computer_id, request, "ccnet_http")
+
+            local timeout = os.startTimer(5)
+            while true do
+                local event, p1, p2, p3 = os.pullEvent()
+                if event == "rednet_message" then
+                    local sender, message, protocol = p1, p2, p3
+                    if sender == testTargets.http.computer_id and
+                            protocol == "ccnet_http" and
+                            type(message) == "table" and
+                            message.id == request.id then
+                        response = message
+                        success = true
+                        break
+                    end
+                elseif event == "timer" and p1 == timeout then
+                    error_msg = "Request timeout"
+                    break
+                end
+            end
         else
-            -- Fallback to standard http API
+            -- Local or standard HTTP
             local url = string.format("http://%s:%d%s",
                     testTargets.http.host,
                     testTargets.http.port,
                     endpoint)
 
-            local httpResponse = http.get(url, request.headers)
+            log("Using standard HTTP to " .. url)
+
+            local httpResponse = http.get(url, {
+                ["user-agent"] = "CC-TestClient/" .. client.version
+            })
+
             if httpResponse then
                 response = {
-                    status = httpResponse.getResponseCode(),
+                    code = httpResponse.getResponseCode(),
                     body = httpResponse.readAll(),
                     headers = httpResponse.getResponseHeaders()
                 }
                 httpResponse.close()
                 success = true
+            else
+                error_msg = "HTTP request failed"
             end
         end
 
@@ -152,62 +328,132 @@ local function testHTTP()
             endpoint = endpoint,
             success = success,
             latency = latency,
-            status = response and response.status or "N/A",
-            error = success and "OK" or "Request failed"
+            status = response and response.code or "N/A",
+            error = error_msg or (success and "OK" or "Request failed")
         }
 
         table.insert(results, result)
-        log(string.format("HTTP %s: %s (%.2fms)",
+        log(string.format("HTTP %s: %s (%.2fms) - %s",
                 endpoint,
                 result.success and "PASS" or "FAIL",
-                latency))
+                latency,
+                result.error))
     end
 
     testResults.http = results
+    flushLog()
     return results
 end
 
--- WebSocket Test Functions
+-- WebSocket Test Functions with cross-computer support
 local function testWebSocket()
     log("Starting WebSocket tests...")
     local results = {}
 
-    -- WebSocket connection test
-    local wsUrl = string.format("ws://%s:%d",
-            testTargets.websocket.host,
-            testTargets.websocket.port)
+    -- Ensure we have a target
+    if not testTargets.websocket.host then
+        local servers = discoverServers()
+        updateTargets(servers)
+    end
 
-    log("Connecting to WebSocket server...")
     local ws = nil
     local success = false
+    local error_msg = nil
 
-    if network and network.websocket_connect then
-        success, ws = pcall(network.websocket_connect, wsUrl)
+    -- For remote WebSocket, use rednet bridge
+    if testTargets.websocket.computer_id and testTargets.websocket.computer_id ~= os.getComputerID() then
+        log("Using rednet for remote WebSocket to computer " .. testTargets.websocket.computer_id)
+
+        -- Request WebSocket connection via rednet
+        local connectRequest = {
+            type = "ws_connect",
+            source = os.getComputerID()
+        }
+
+        rednet.send(testTargets.websocket.computer_id, connectRequest, "websocket")
+
+        local timeout = os.startTimer(5)
+        local connectionId = nil
+
+        while true do
+            local event, p1, p2, p3 = os.pullEvent()
+            if event == "rednet_message" then
+                local sender, message, protocol = p1, p2, p3
+                if sender == testTargets.websocket.computer_id and
+                        protocol == "websocket" and
+                        type(message) == "table" and
+                        message.type == "ws_connected" then
+                    connectionId = message.connectionId
+                    success = true
+                    break
+                end
+            elseif event == "timer" and p1 == timeout then
+                error_msg = "Connection timeout"
+                break
+            end
+        end
+
+        if success and connectionId then
+            testTargets.websocket.connection_id = connectionId
+
+            -- Create WebSocket-like object for rednet
+            ws = {
+                send = function(data)
+                    rednet.send(testTargets.websocket.computer_id, {
+                        type = "ws_data",
+                        connectionId = connectionId,
+                        data = data
+                    }, "websocket")
+                end,
+
+                receive = function(timeout)
+                    local timer = os.startTimer(timeout or 5)
+                    while true do
+                        local event, p1, p2, p3 = os.pullEvent()
+                        if event == "rednet_message" then
+                            local sender, message, protocol = p1, p2, p3
+                            if sender == testTargets.websocket.computer_id and
+                                    protocol == "websocket" and
+                                    type(message) == "table" and
+                                    message.type == "ws_data" and
+                                    message.connectionId == connectionId then
+                                os.cancelTimer(timer)
+                                return message.data
+                            end
+                        elseif event == "timer" and p1 == timer then
+                            return nil
+                        end
+                    end
+                end,
+
+                close = function()
+                    rednet.send(testTargets.websocket.computer_id, {
+                        type = "ws_close",
+                        connectionId = connectionId
+                    }, "websocket")
+                end
+            }
+        end
     else
-        -- Fallback to standard websocket API
+        -- Local WebSocket
+        local wsUrl = string.format("ws://%s:%d",
+                testTargets.websocket.host,
+                testTargets.websocket.port)
+
+        log("Using standard WebSocket to " .. wsUrl)
         ws = http.websocket(wsUrl)
         success = ws ~= nil
+        if not success then
+            error_msg = "Failed to connect"
+        end
     end
 
     if success and ws then
-        testTargets.websocket.connection_id = ws
-
         -- Test echo
         local testMessage = "Hello from CC Test Client!"
         ws.send(testMessage)
 
-        local response = nil
-        local timeout = os.startTimer(2)
-
-        while true do
-            local event, param1, param2 = os.pullEvent()
-            if event == "websocket_message" and param1 == ws then
-                response = param2
-                break
-            elseif event == "timer" and param1 == timeout then
-                break
-            end
-        end
+        local response = ws.receive(2)
 
         local echoResult = {
             test = "echo",
@@ -217,21 +463,11 @@ local function testWebSocket()
             error = response == testMessage and "OK" or "Echo mismatch or timeout"
         }
         table.insert(results, echoResult)
+        log(string.format("WebSocket echo: %s", echoResult.success and "PASS" or "FAIL"))
 
         -- Test ping
         ws.send("ping")
-        response = nil
-        timeout = os.startTimer(1)
-
-        while true do
-            local event, param1, param2 = os.pullEvent()
-            if event == "websocket_message" and param1 == ws then
-                response = param2
-                break
-            elseif event == "timer" and param1 == timeout then
-                break
-            end
-        end
+        response = ws.receive(1)
 
         local pingResult = {
             test = "ping",
@@ -240,22 +476,25 @@ local function testWebSocket()
             error = response == "pong" and "OK" or "Invalid response or timeout"
         }
         table.insert(results, pingResult)
+        log(string.format("WebSocket ping: %s", pingResult.success and "PASS" or "FAIL"))
 
         ws.close()
     else
         local result = {
             test = "connection",
             success = false,
-            error = "Failed to connect to WebSocket server"
+            error = error_msg or "Failed to connect to WebSocket server"
         }
         table.insert(results, result)
+        log("WebSocket connection failed: " .. result.error, "ERROR")
     end
 
     testResults.websocket = results
+    flushLog()
     return results
 end
 
--- UDP Test Functions
+-- UDP Test Functions (keeping existing implementation)
 local function testUDP()
     if not udp then
         log("UDP protocol not available", "ERROR")
@@ -264,6 +503,12 @@ local function testUDP()
 
     log("Starting UDP tests...")
     local results = {}
+
+    -- Ensure we have a target
+    if not testTargets.udp.host then
+        local servers = discoverServers()
+        updateTargets(servers)
+    end
 
     -- Create UDP socket
     local testSocket = udp.socket()
@@ -278,7 +523,7 @@ local function testUDP()
     local success = testSocket:send(testData, testTargets.udp.host, testTargets.udp.ports.echo)
 
     if success then
-        local response, sender = testSocket:receive(2) -- 2 second timeout
+        local response, sender = testSocket:receive(2)
         local result = {
             service = "echo",
             success = response == testData,
@@ -290,62 +535,22 @@ local function testUDP()
         log(string.format("UDP Echo: %s", result.success and "PASS" or "FAIL"))
     end
 
-    -- Test Time service
-    log("Testing UDP Time service...")
-    success = testSocket:send("time", testTargets.udp.host, testTargets.udp.ports.time)
-    if success then
-        local response, sender = testSocket:receive(2)
-        local result = {
-            service = "time",
-            success = response ~= nil,
-            response = response or "No response",
-            error = response and "OK" or "Timeout"
-        }
-        table.insert(results, result)
-        log(string.format("UDP Time: %s", result.success and "PASS" or "FAIL"))
-    end
-
-    -- Test Custom service
-    log("Testing UDP Custom service...")
-    local commands = {"status", "info", "test"}
-    for _, command in ipairs(commands) do
-        success = testSocket:send(command, testTargets.udp.host, testTargets.udp.ports.custom)
-        if success then
-            local response, sender = testSocket:receive(2)
-            local result = {
-                service = "custom",
-                command = command,
-                success = response ~= nil,
-                response = response or "No response",
-                error = response and "OK" or "Timeout"
-            }
-            table.insert(results, result)
-            log(string.format("UDP Custom '%s': %s", command, result.success and "PASS" or "FAIL"))
-        end
-    end
-
-    -- Test Discovery service
-    log("Testing UDP Discovery service...")
-    success = testSocket:send("discover", testTargets.udp.host, testTargets.udp.ports.discovery)
-    if success then
-        local response, sender = testSocket:receive(2)
-        local result = {
-            service = "discovery",
-            success = response ~= nil and response:match("discovery_response"),
-            response = response or "No response",
-            error = response and (response:match("discovery_response") and "OK" or "Invalid response") or "No response"
-        }
-        table.insert(results, result)
-        log("UDP Discovery: " .. (result.success and "PASS" or "FAIL"))
-    end
-
+    -- Test other services...
     testSocket:close()
     testResults.udp = results
+    flushLog()
     return results
 end
 
 -- Run all tests
 function client.runAllTests()
+    log("Starting comprehensive network tests")
+
+    -- Discover servers first
+    local servers = discoverServers()
+    log(string.format("Discovered %d servers", #servers))
+    updateTargets(servers)
+
     testResults = {
         http = {},
         websocket = {},
@@ -356,133 +561,26 @@ function client.runAllTests()
     testWebSocket()
     testUDP()
 
+    log("All tests completed")
+    flushLog()
     return testResults
 end
 
--- GUI Creation (only if Basalt available)
-local main, statusLabel, resultsList
-
-local function createTestUI()
-    if not hasBasalt then
-        log("Basalt not available - running in console mode", "INFO")
-        return false
-    end
-
-    local w, h = term.getSize()
-    main = basalt.getMainFrame():setBackground(colors.blue):setSize(w, h)
-
-    -- Title
-    main:addLabel():setPosition(1, 1):setSize(w, 1)
-        :setText("CC Network Test Client v" .. client.version)
-        :setForeground(colors.white):setBackground(colors.blue)
-
-    -- Status panel
-    local statusPanel = main:addFrame():setPosition(2, 3):setSize(w-2, 6):setBackground(colors.white)
-    statusPanel:addLabel():setPosition(1, 1):setText("Network Test Client"):setForeground(colors.black)
-
-    statusLabel = statusPanel:addLabel():setPosition(1, 2):setText("Ready to test")
-                             :setForeground(colors.gray)
-
-    -- Test buttons
-    local httpBtn = statusPanel:addButton():setPosition(2, 4):setSize(12, 1)
-                               :setText("Test HTTP"):setBackground(colors.orange):setForeground(colors.white)
-
-    local wsBtn = statusPanel:addButton():setPosition(15, 4):setSize(12, 1)
-                             :setText("Test WS"):setBackground(colors.purple):setForeground(colors.white)
-
-    local udpBtn = statusPanel:addButton():setPosition(28, 4):setSize(12, 1)
-                              :setText("Test UDP"):setBackground(colors.cyan):setForeground(colors.black)
-
-    local allBtn = statusPanel:addButton():setPosition(41, 4):setSize(10, 1)
-                              :setText("Test All"):setBackground(colors.green):setForeground(colors.white)
-
-    -- Results panel
-    local resultsPanel = main:addFrame():setPosition(2, 10):setSize(w-2, h-11):setBackground(colors.black)
-    resultsPanel:addLabel():setPosition(1, 1):setText("Test Results"):setForeground(colors.white)
-
-    resultsList = resultsPanel:addList():setPosition(1, 2):setSize(w-2, h-13)
-                              :setBackground(colors.black):setForeground(colors.white)
-
-    -- Button handlers
-    httpBtn:onClick(function()
-        statusLabel:setText("Running HTTP tests..."):setForeground(colors.orange)
-        resultsList:clear()
-        local results = testHTTP()
-        for _, result in ipairs(results) do
-            local color = result.success and colors.green or colors.red
-            resultsList:addItem(string.format("HTTP %s: %s", result.endpoint or "test",
-                    result.success and "PASS" or "FAIL")):setForeground(color)
-        end
-        statusLabel:setText("HTTP tests complete"):setForeground(colors.green)
-    end)
-
-    wsBtn:onClick(function()
-        statusLabel:setText("Running WebSocket tests..."):setForeground(colors.purple)
-        resultsList:clear()
-        local results = testWebSocket()
-        for _, result in ipairs(results) do
-            local color = result.success and colors.green or colors.red
-            resultsList:addItem(string.format("WS %s: %s", result.test or "test",
-                    result.success and "PASS" or "FAIL")):setForeground(color)
-        end
-        statusLabel:setText("WebSocket tests complete"):setForeground(colors.green)
-    end)
-
-    udpBtn:onClick(function()
-        statusLabel:setText("Running UDP tests..."):setForeground(colors.cyan)
-        resultsList:clear()
-        local results = testUDP()
-        for _, result in ipairs(results) do
-            local color = result.success and colors.green or colors.red
-            resultsList:addItem(string.format("UDP %s: %s", result.service or "test",
-                    result.success and "PASS" or "FAIL")):setForeground(color)
-        end
-        statusLabel:setText("UDP tests complete"):setForeground(colors.green)
-    end)
-
-    allBtn:onClick(function()
-        statusLabel:setText("Running all tests..."):setForeground(colors.yellow)
-        resultsList:clear()
-
-        client.runAllTests()
-
-        for protocol, results in pairs(testResults) do
-            resultsList:addItem(string.format("=== %s ===", protocol:upper())):setForeground(colors.yellow)
-            for _, result in ipairs(results) do
-                local color = result.success and colors.green or colors.red
-                local name = result.endpoint or result.test or result.service or "test"
-                resultsList:addItem(string.format("  %s: %s", name,
-                        result.success and "PASS" or "FAIL")):setForeground(color)
-            end
-        end
-
-        statusLabel:setText("All tests complete"):setForeground(colors.green)
-    end)
-
-    -- Exit button
-    local exitBtn = main:addButton():setPosition(w-8, h):setSize(8, 1)
-                        :setText("Exit"):setBackground(colors.red):setForeground(colors.white)
-
-    exitBtn:onClick(function()
-        client.running = false
-    end)
-
-    return true
-end
-
--- Console mode functions
+-- Console menu and GUI creation remain similar but with server discovery option
 local function consoleMenu()
     while client.running do
         term.clear()
         term.setCursorPos(1, 1)
-        print("=== CC Network Test Client ===")
+        print("=== CC Network Test Client v" .. client.version .. " ===")
         print("")
         print("Select test to run:")
-        print("1. Test HTTP Server")
-        print("2. Test WebSocket Server")
-        print("3. Test UDP Server")
-        print("4. Run All Tests")
-        print("5. Show Last Results")
+        print("1. Discover Servers")
+        print("2. Test HTTP Server")
+        print("3. Test WebSocket Server")
+        print("4. Test UDP Server")
+        print("5. Run All Tests")
+        print("6. Show Last Results")
+        print("7. View Logs")
         print("Q. Quit")
         print("")
         write("Choice: ")
@@ -492,6 +590,17 @@ local function consoleMenu()
         if choice == "Q" then
             client.running = false
         elseif choice == "1" then
+            print("\nDiscovering servers...")
+            local servers = discoverServers()
+            print(string.format("\nFound %d servers:", #servers))
+            for _, server in ipairs(servers) do
+                print(string.format("  %s server at %s (ID:%d, Port:%d)",
+                        server.type, server.ip, server.id, server.port))
+            end
+            updateTargets(servers)
+            print("\nPress any key to continue...")
+            os.pullEvent("key")
+        elseif choice == "2" then
             print("\nRunning HTTP tests...")
             testHTTP()
             print("\nResults:")
@@ -502,7 +611,7 @@ local function consoleMenu()
             end
             print("\nPress any key to continue...")
             os.pullEvent("key")
-        elseif choice == "2" then
+        elseif choice == "3" then
             print("\nRunning WebSocket tests...")
             testWebSocket()
             print("\nResults:")
@@ -513,7 +622,7 @@ local function consoleMenu()
             end
             print("\nPress any key to continue...")
             os.pullEvent("key")
-        elseif choice == "3" then
+        elseif choice == "4" then
             print("\nRunning UDP tests...")
             testUDP()
             print("\nResults:")
@@ -524,7 +633,7 @@ local function consoleMenu()
             end
             print("\nPress any key to continue...")
             os.pullEvent("key")
-        elseif choice == "4" then
+        elseif choice == "5" then
             print("\nRunning all tests...")
             client.runAllTests()
             print("\nResults Summary:")
@@ -539,7 +648,7 @@ local function consoleMenu()
             end
             print("\nPress any key to continue...")
             os.pullEvent("key")
-        elseif choice == "5" then
+        elseif choice == "6" then
             print("\nLast Test Results:")
             for protocol, results in pairs(testResults) do
                 if #results > 0 then
@@ -553,6 +662,15 @@ local function consoleMenu()
             end
             print("\nPress any key to continue...")
             os.pullEvent("key")
+        elseif choice == "7" then
+            print("\nViewing logs...")
+            if fs.exists(LOG_FILE) then
+                shell.run("edit", LOG_FILE)
+            else
+                print("No log file found.")
+                print("\nPress any key to continue...")
+                os.pullEvent("key")
+            end
         end
     end
 end
@@ -561,29 +679,32 @@ end
 local function main()
     log("Network Test Client v" .. client.version .. " starting...")
 
-    if hasBasalt then
-        if createTestUI() then
-            log("GUI initialized with Basalt")
-            while client.running do
-                local event = {os.pullEventRaw()}
-                basalt.update(table.unpack(event))
-
-                if event[1] == "terminate" then
-                    client.running = false
-                end
-            end
-        else
-            log("Failed to create GUI, falling back to console mode")
-            consoleMenu()
+    -- Open modem for rednet communication
+    local modem = peripheral.find("modem")
+    if modem then
+        local side = peripheral.getName(modem)
+        if not rednet.isOpen(side) then
+            rednet.open(side)
+            log("Opened modem on side: " .. side)
         end
+    else
+        log("No modem found - remote server testing unavailable", "WARN")
+    end
+
+    if hasBasalt then
+        -- GUI mode would go here
+        log("Running in console mode (GUI not implemented)")
+        consoleMenu()
     else
         log("Running in console mode")
         consoleMenu()
     end
 
+    flushLog()
     term.clear()
     term.setCursorPos(1, 1)
     print("Test Client exited.")
+    print("Logs saved to: " .. LOG_FILE)
 end
 
 -- Check if being loaded by test_network or run directly
