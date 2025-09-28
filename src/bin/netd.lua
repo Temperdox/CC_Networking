@@ -5,6 +5,8 @@
 local version = "1.0.0"
 local daemon_name = "netd"
 
+print("[netd] Starting Network Daemon v" .. version)
+
 -- Check if already running
 if fs.exists("/var/run/netd.pid") then
     local pidFile = fs.open("/var/run/netd.pid", "r")
@@ -16,28 +18,46 @@ if fs.exists("/var/run/netd.pid") then
     end
 end
 
--- Load configuration
+-- Load configuration with better error handling
 local function loadConfig()
-    local config_path = "/config/network.cfg"
-    if not fs.exists(config_path) then
-        error("[netd] Configuration file not found: " .. config_path)
+    local config_paths = {"/config/network.cfg", "/etc/network.cfg"}
+
+    for _, config_path in ipairs(config_paths) do
+        if fs.exists(config_path) then
+            print("[netd] Loading config from: " .. config_path)
+
+            local file = fs.open(config_path, "r")
+            if not file then
+                print("[netd] ERROR: Cannot read config file: " .. config_path)
+                goto continue
+            end
+
+            local content = file.readAll()
+            file.close()
+
+            local func, err = loadstring(content)
+            if not func then
+                print("[netd] ERROR: Failed to parse config: " .. tostring(err))
+                goto continue
+            end
+
+            local success, result = pcall(func)
+            if success and result then
+                print("[netd] Configuration loaded successfully")
+                return result
+            else
+                print("[netd] ERROR: Config execution failed: " .. tostring(result))
+            end
+        end
+        ::continue::
     end
 
-    local file = fs.open(config_path, "r")
-    local content = file.readAll()
-    file.close()
-
-    local func, err = loadstring(content)
-    if not func then
-        error("[netd] Failed to parse config: " .. err)
-    end
-
-    return func()
+    error("[netd] FATAL: No valid configuration found")
 end
 
 local cfg = loadConfig()
 
--- Logger setup with parallel writing
+-- Simple synchronous logger (no parallel issues)
 local logger = {
     levels = {
         trace = 1,
@@ -47,144 +67,67 @@ local logger = {
         error = 5
     },
     current_level = 3,
-    log_file = nil,
-    backup_log_file = nil,
-    entries = {},
-    max_entries = 1000,
-    log_queue = {},
-    logging_active = false
+    log_files = {}
 }
 
 function logger:init()
+    -- Create directories
+    if not fs.exists("logs") then
+        fs.makeDir("logs")
+    end
+    if not fs.exists("/var/log") then
+        fs.makeDir("/var/log")
+    end
+
+    -- Open multiple log files
+    self.log_files["main"] = fs.open("logs/netd.log", "a")
+
     if cfg.logging and cfg.logging.enabled then
         self.current_level = self.levels[cfg.logging.level] or 3
-        self.max_entries = cfg.logging.max_size or 1000
-
-        -- Create log directory if needed
         local log_dir = fs.getDir(cfg.logging.file)
         if log_dir ~= "" and not fs.exists(log_dir) then
             fs.makeDir(log_dir)
         end
-
-        -- Also ensure logs directory exists for consistency
-        if not fs.exists("logs") then
-            fs.makeDir("logs")
-        end
-
-        -- Open log files
-        self.log_file = fs.open(cfg.logging.file, "a")
-        self.backup_log_file = fs.open("logs/netd.log", "a")
-    else
-        -- Even if logging is disabled in config, create basic logs directory and file
-        if not fs.exists("logs") then
-            fs.makeDir("logs")
-        end
-
-        -- Create basic log file
-        self.backup_log_file = fs.open("logs/netd.log", "a")
+        self.log_files["config"] = fs.open(cfg.logging.file, "a")
     end
 
-    -- Start parallel logging process
-    self.logging_active = true
-    self:startLogWriter()
-end
-
-function logger:startLogWriter()
-    -- Start the logging thread in parallel
-    parallel.waitForAny(function()
-        while self.logging_active do
-            if #self.log_queue > 0 then
-                -- Process queued log entries
-                local entries_to_write = {}
-
-                -- Batch up to 10 entries at once for efficiency
-                for i = 1, math.min(10, #self.log_queue) do
-                    table.insert(entries_to_write, table.remove(self.log_queue, 1))
-                end
-
-                -- Write to files
-                for _, entry in ipairs(entries_to_write) do
-                    if self.log_file then
-                        self.log_file.writeLine(entry)
-                        self.log_file.flush()
-                    end
-
-                    if self.backup_log_file then
-                        self.backup_log_file.writeLine(entry)
-                        self.backup_log_file.flush()
-                    end
-                end
-            else
-                -- No entries to write, sleep briefly
-                sleep(0.1)
-            end
-        end
-    end)
+    self:info("Network daemon logger initialized")
 end
 
 function logger:log(level, msg, ...)
     if self.levels[level] >= self.current_level then
-        local timestamp = os.date and os.date("%Y-%m-%d %H:%M:%S") or tostring(os.time())
+        local timestamp = os.date("%Y-%m-%d %H:%M:%S")
         local formatted = string.format(msg, ...)
         local log_line = string.format("[%s] [%s] %s", timestamp, level:upper(), formatted)
 
-        -- Print to console immediately (non-blocking)
+        -- Always print to console
         print(log_line)
 
-        -- Queue for file writing (non-blocking)
-        table.insert(self.log_queue, log_line)
-
-        -- Store in memory (limited)
-        table.insert(self.entries, {
-            timestamp = timestamp,
-            level = level,
-            message = formatted
-        })
-        if #self.entries > self.max_entries then
-            table.remove(self.entries, 1)
-        end
-
-        -- Prevent queue from growing too large
-        if #self.log_queue > 1000 then
-            -- Remove oldest entries if queue gets too full
-            for i = 1, 100 do
-                table.remove(self.log_queue, 1)
+        -- Write to all log files immediately
+        for name, file in pairs(self.log_files) do
+            if file then
+                file.writeLine(log_line)
+                file.flush()
             end
         end
     end
 end
 
-function logger:close()
-    -- Stop the logging thread
-    self.logging_active = false
-
-    -- Write any remaining queued entries
-    while #self.log_queue > 0 do
-        local entry = table.remove(self.log_queue, 1)
-        if self.log_file then
-            self.log_file.writeLine(entry)
-        end
-        if self.backup_log_file then
-            self.backup_log_file.writeLine(entry)
-        end
-    end
-
-    -- Close files
-    if self.log_file then
-        self.log_file.close()
-        self.log_file = nil
-    end
-    if self.backup_log_file then
-        self.backup_log_file.close()
-        self.backup_log_file = nil
-    end
-end
-
-function logger:trace(msg, ...) self:log("trace", msg, ...) end
-function logger:debug(msg, ...) self:log("debug", msg, ...) end
 function logger:info(msg, ...) self:log("info", msg, ...) end
+function logger:debug(msg, ...) self:log("debug", msg, ...) end
 function logger:warn(msg, ...) self:log("warn", msg, ...) end
 function logger:error(msg, ...) self:log("error", msg, ...) end
+function logger:trace(msg, ...) self:log("trace", msg, ...) end
+
+function logger:close()
+    self:info("Closing logger")
+    for name, file in pairs(self.log_files) do
+        if file then
+            file.close()
+        end
+    end
+    self.log_files = {}
+end
 
 -- Initialize logger
 logger:init()
@@ -230,11 +173,11 @@ end
 local function saveState()
     local file = fs.open(state_file, "w")
     if file then
-        -- Don't save transient data
         local to_save = {
             dns_cache = network_state.dns_cache,
             arp_cache = network_state.arp_cache,
-            stats = network_state.stats
+            stats = network_state.stats,
+            start_time = network_state.start_time
         }
         file.write(textutils.serialize(to_save))
         file.close()
@@ -243,14 +186,12 @@ end
 
 -- Open modem
 local function openModem()
-    -- Check if already open
     if rednet.isOpen() then
         logger:debug("Rednet already open")
         return true
     end
 
     if cfg.modem_side == "auto" then
-        -- Find any modem
         local modem = peripheral.find("modem")
         if modem then
             local side = peripheral.getName(modem)
@@ -259,7 +200,6 @@ local function openModem()
             return true
         end
     else
-        -- Try specific side
         if peripheral.isPresent(cfg.modem_side) and peripheral.getType(cfg.modem_side) == "modem" then
             rednet.open(cfg.modem_side)
             logger:info("Modem opened on side: %s", cfg.modem_side)
@@ -267,7 +207,7 @@ local function openModem()
         end
     end
 
-    logger:warn("No modem found - local network features disabled")
+    logger:warn("No modem found - network features disabled")
     return false
 end
 
@@ -280,11 +220,10 @@ local function initNetwork()
     -- Load saved state
     loadState()
 
-    -- Open modem for local network
+    -- Open modem
     local modem_opened = openModem()
 
     if modem_opened then
-        -- Register hostname with rednet for local network
         rednet.host(cfg.proto, cfg.hostname)
         logger:debug("Registered hostname: %s", cfg.hostname)
     end
@@ -302,9 +241,10 @@ local function initNetwork()
     if pid_file then
         pid_file.write(tostring(cfg.id))
         pid_file.close()
+        logger:info("Created PID file")
     end
 
-    -- Write network info file for other programs
+    -- Write network info file
     local info_file = fs.open("/var/run/network.info", "w")
     if info_file then
         info_file.write(textutils.serialize({
@@ -317,15 +257,18 @@ local function initNetwork()
             modem_available = modem_opened
         }))
         info_file.close()
+        logger:debug("Created network info file")
     end
 
-    -- Initial network announcement
+    -- Initial broadcast
     if modem_opened then
         broadcastPresence()
     end
+
+    return modem_opened
 end
 
--- Broadcast network presence (local network only)
+-- Broadcast network presence
 function broadcastPresence()
     if not rednet.isOpen() then
         return
@@ -342,9 +285,11 @@ function broadcastPresence()
     }
 
     -- Add enabled services
-    for service, config in pairs(cfg.services) do
-        if config.enabled then
-            announcement.services[service] = config.port
+    if cfg.services then
+        for service, config in pairs(cfg.services) do
+            if config.enabled then
+                announcement.services[service] = config.port
+            end
         end
     end
 
@@ -356,7 +301,6 @@ end
 -- Handle discovery protocol
 local function handleDiscovery(sender, message)
     if message == "whoami?" then
-        -- Simple identification response
         local response = {
             id = cfg.id,
             hostname = cfg.hostname,
@@ -367,7 +311,6 @@ local function handleDiscovery(sender, message)
         logger:trace("Sent identity to computer %d", sender)
 
     elseif type(message) == "table" and message.type == "query" then
-        -- Detailed query response
         local response = {
             type = "response",
             id = cfg.id,
@@ -380,9 +323,11 @@ local function handleDiscovery(sender, message)
             timestamp = os.epoch("utc")
         }
 
-        for service, config in pairs(cfg.services) do
-            if config.enabled then
-                response.services[service] = config.port
+        if cfg.services then
+            for service, config in pairs(cfg.services) do
+                if config.enabled then
+                    response.services[service] = config.port
+                end
             end
         end
 
@@ -390,12 +335,10 @@ local function handleDiscovery(sender, message)
         logger:trace("Sent detailed info to computer %d", sender)
 
     elseif type(message) == "table" and message.type == "announce" then
-        -- Another computer announcing itself
         logger:debug("Computer %d announced: %s (%s)",
                 sender, message.hostname or "unknown", message.ip or "unknown")
 
-        -- Update ARP cache
-        if message.ip and message.mac then
+        if message.ip and message.mac and cfg.cache then
             network_state.arp_cache[message.ip] = {
                 mac = message.mac,
                 hostname = message.hostname,
@@ -403,8 +346,8 @@ local function handleDiscovery(sender, message)
                 expires = os.epoch("utc") + (cfg.cache.arp_ttl * 1000)
             }
         end
+
     elseif type(message) == "table" and message.type == "id_query" then
-        -- Someone asking for computer ID by IP
         if message.ip == cfg.ipv4 then
             local response = {
                 type = "id_response",
@@ -424,7 +367,6 @@ local function handleDNS(sender, message)
     if type(message) ~= "table" then return end
 
     if message.type == "query" and message.hostname then
-        -- Check if we can answer this query
         if message.hostname == cfg.hostname or
                 message.hostname == cfg.fqdn or
                 message.hostname == "localhost" then
@@ -433,14 +375,14 @@ local function handleDNS(sender, message)
                 type = "response",
                 hostname = message.hostname,
                 ip = message.hostname == "localhost" and "127.0.0.1" or cfg.ipv4,
-                ttl = cfg.cache.dns_ttl
+                ttl = cfg.cache and cfg.cache.dns_ttl or 300
             }
 
             rednet.send(sender, response, cfg.dns_proto)
             logger:debug("Answered DNS query for %s from computer %d", message.hostname, sender)
         end
 
-        -- Check cache for other hosts
+        -- Check cache
         local cached = network_state.dns_cache[message.hostname]
         if cached and cached.expires > os.epoch("utc") then
             local response = {
@@ -454,11 +396,10 @@ local function handleDNS(sender, message)
         end
 
     elseif message.type == "response" then
-        -- DNS response (cache it)
         if message.hostname and message.ip then
             network_state.dns_cache[message.hostname] = {
                 ip = message.ip,
-                expires = os.epoch("utc") + ((message.ttl or cfg.cache.dns_ttl) * 1000)
+                expires = os.epoch("utc") + ((message.ttl or 300) * 1000)
             }
             logger:trace("Cached DNS entry: %s -> %s", message.hostname, message.ip)
         end
@@ -472,7 +413,6 @@ local function handleARP(sender, message)
     if type(message) ~= "table" then return end
 
     if message.type == "request" and message.ip == cfg.ipv4 then
-        -- Someone is asking for our MAC
         local response = {
             type = "reply",
             ip = cfg.ipv4,
@@ -484,13 +424,12 @@ local function handleARP(sender, message)
         logger:debug("Answered ARP request from computer %d", sender)
 
     elseif message.type == "reply" then
-        -- ARP reply (cache it)
         if message.ip and message.mac then
             network_state.arp_cache[message.ip] = {
                 mac = message.mac,
                 hostname = message.hostname,
                 computer_id = sender,
-                expires = os.epoch("utc") + (cfg.cache.arp_ttl * 1000)
+                expires = os.epoch("utc") + ((cfg.cache and cfg.cache.arp_ttl or 600) * 1000)
             }
             logger:trace("Cached ARP entry: %s -> %s (computer %d)",
                     message.ip, message.mac, sender)
@@ -500,22 +439,19 @@ local function handleARP(sender, message)
     network_state.stats.packets_received = network_state.stats.packets_received + 1
 end
 
--- Handle HTTP protocol (local network)
+-- Handle HTTP protocol
 local function handleHTTP(sender, message)
     if type(message) ~= "table" then return end
 
     if message.type == "request" or message.type == "http_request" then
-        -- HTTP request packet
         local server = network_state.servers[message.port]
         local response
 
         if server and server.handler then
-            -- We have a server on this port
             logger:debug("HTTP %s request from %s to port %d: %s",
                     message.method, message.source and message.source.ip or "unknown",
                     message.port, message.path)
 
-            -- Call the handler
             local success, result = pcall(server.handler, message)
             if success then
                 response = result
@@ -528,7 +464,6 @@ local function handleHTTP(sender, message)
                 }
             end
         else
-            -- No server on this port
             response = {
                 code = 404,
                 body = "Not Found",
@@ -536,7 +471,6 @@ local function handleHTTP(sender, message)
             }
         end
 
-        -- Send response
         local responsePacket = {
             type = "response",
             id = message.id,
@@ -550,23 +484,20 @@ local function handleHTTP(sender, message)
         network_state.stats.packets_sent = network_state.stats.packets_sent + 1
 
     elseif message.type == "response" or message.type == "http_response" then
-        -- HTTP response packet (handled by client)
         logger:trace("HTTP response %d from computer %d", message.code or 0, sender)
     end
 
     network_state.stats.packets_received = network_state.stats.packets_received + 1
 end
 
--- Handle WebSocket protocol (local network)
+-- Handle WebSocket protocol
 local function handleWebSocket(sender, message)
     if type(message) ~= "table" then return end
 
     if message.type == "connect" or message.type == "ws_connect" then
-        -- WebSocket connection request
         local server = network_state.servers[message.url and message.url.port or 8080]
 
         if server and server.ws_handler then
-            -- Accept connection
             local response = {
                 type = "accept",
                 connectionId = message.connectionId,
@@ -575,7 +506,6 @@ local function handleWebSocket(sender, message)
 
             rednet.send(sender, response, cfg.ws_proto)
 
-            -- Store connection
             network_state.connections[message.connectionId] = {
                 id = message.connectionId,
                 peer = sender,
@@ -586,7 +516,6 @@ local function handleWebSocket(sender, message)
             logger:info("WebSocket connection %s established with computer %d",
                     message.connectionId, sender)
         else
-            -- Reject connection
             local response = {
                 type = "reject",
                 connectionId = message.connectionId,
@@ -597,7 +526,6 @@ local function handleWebSocket(sender, message)
         end
 
     elseif message.type == "data" or message.type == "ws_data" then
-        -- WebSocket data packet
         local conn = network_state.connections[message.connectionId]
         if conn then
             conn.lastActivity = os.epoch("utc")
@@ -605,7 +533,6 @@ local function handleWebSocket(sender, message)
         end
 
     elseif message.type == "close" or message.type == "ws_close" then
-        -- WebSocket close
         local conn = network_state.connections[message.connectionId]
         if conn then
             network_state.connections[message.connectionId] = nil
@@ -643,11 +570,10 @@ local function handleNetworkAdapter(sender, message, protocol)
     end
 end
 
--- Handle ping protocol (ICMP-like)
+-- Handle ping protocol
 local function handlePing(sender, message)
     if type(message) == "table" then
         if message.type == "ping" and message.source then
-            -- Someone is pinging us, send pong
             local response = {
                 type = "pong",
                 seq = message.seq,
@@ -666,30 +592,25 @@ local function cleanupCache()
     local now = os.epoch("utc")
     local cleaned = 0
 
-    -- Clean DNS cache
     for hostname, entry in pairs(network_state.dns_cache) do
         if entry.expires < now then
             network_state.dns_cache[hostname] = nil
             cleaned = cleaned + 1
-            logger:trace("Expired DNS entry: %s", hostname)
         end
     end
 
-    -- Clean ARP cache
     for ip, entry in pairs(network_state.arp_cache) do
         if entry.expires < now then
             network_state.arp_cache[ip] = nil
             cleaned = cleaned + 1
-            logger:trace("Expired ARP entry: %s", ip)
         end
     end
 
-    -- Clean stale connections
     for id, conn in pairs(network_state.connections) do
-        if (now - conn.lastActivity) > (cfg.advanced.connection_timeout * 1000) then
+        local timeout = cfg.advanced and cfg.advanced.connection_timeout or 30
+        if (now - conn.lastActivity) > (timeout * 1000) then
             network_state.connections[id] = nil
             cleaned = cleaned + 1
-            logger:debug("Cleaned up stale connection: %s", id)
         end
     end
 
@@ -700,7 +621,6 @@ end
 
 -- Write statistics
 local function writeStats()
-    -- Calculate uptime
     network_state.stats.uptime = os.epoch("utc") - network_state.start_time
 
     local stats_file = fs.open("/var/run/netd.stats", "w")
@@ -712,20 +632,20 @@ end
 
 -- Main daemon loop
 local function mainLoop()
-    local next_broadcast = os.epoch("utc") + (cfg.services.discovery.interval * 1000)
-    local next_cleanup = os.epoch("utc") + 60000  -- Every minute
-    local next_stats = os.epoch("utc") + 10000    -- Every 10 seconds
-    local next_save = os.epoch("utc") + 300000    -- Every 5 minutes
+    local next_broadcast = os.epoch("utc") + ((cfg.services and cfg.services.discovery and cfg.services.discovery.interval or 30) * 1000)
+    local next_cleanup = os.epoch("utc") + 60000
+    local next_stats = os.epoch("utc") + 10000
+    local next_save = os.epoch("utc") + 300000
 
     logger:info("Entering main loop")
 
     while network_state.running do
+        local timer = os.startTimer(1)
         local event = {os.pullEvent()}
 
         if event[1] == "rednet_message" then
             local sender, message, protocol = event[2], event[3], event[4]
 
-            -- Route to appropriate handler
             if protocol == cfg.proto or protocol == cfg.discovery_proto then
                 handleDiscovery(sender, message)
             elseif protocol == cfg.dns_proto then
@@ -741,7 +661,6 @@ local function mainLoop()
             elseif protocol and protocol:match("^network_adapter") then
                 handleNetworkAdapter(sender, message, protocol)
             elseif protocol == "network_packet" then
-                -- Generic network packet routing
                 if type(message) == "table" then
                     if message.type == "http_request" then
                         handleHTTP(sender, message)
@@ -751,28 +670,24 @@ local function mainLoop()
                 end
             end
 
-        elseif event[1] == "timer" then
+        elseif event[1] == "timer" and event[2] == timer then
             local now = os.epoch("utc")
 
-            -- Periodic broadcasts (local network only)
-            if cfg.services.discovery.enabled and now >= next_broadcast and rednet.isOpen() then
+            if cfg.services and cfg.services.discovery and cfg.services.discovery.enabled and now >= next_broadcast and rednet.isOpen() then
                 broadcastPresence()
                 next_broadcast = now + (cfg.services.discovery.interval * 1000)
             end
 
-            -- Cache cleanup
             if now >= next_cleanup then
                 cleanupCache()
                 next_cleanup = now + 60000
             end
 
-            -- Statistics
             if now >= next_stats then
                 writeStats()
                 next_stats = now + 10000
             end
 
-            -- Save state
             if now >= next_save then
                 saveState()
                 next_save = now + 300000
@@ -783,9 +698,6 @@ local function mainLoop()
             logger:info("Received termination signal")
             network_state.running = false
         end
-
-        -- Set up timers for next iteration
-        os.startTimer(1)
     end
 end
 
@@ -793,62 +705,41 @@ end
 local function shutdown()
     logger:info("Shutting down %s", daemon_name)
 
-    -- Save final state
     saveState()
-
-    -- Write final statistics
     writeStats()
 
-    -- Close all connections
     for id, conn in pairs(network_state.connections) do
         logger:debug("Closing connection: %s", id)
     end
     network_state.connections = {}
 
-    -- Remove PID file
     if fs.exists("/var/run/netd.pid") then
         fs.delete("/var/run/netd.pid")
     end
 
-    -- Close log file
-    if logger.log_file then
-        logger.log_file:close()
-    end
-
-    -- Unhost from rednet
     if rednet.isOpen() then
         rednet.unhost(cfg.proto)
     end
 
+    logger:close()
     logger:info("%s stopped", daemon_name)
 end
 
--- Main execution with parallel logging
+-- Main execution
 local function main()
-    -- Initialize network first
-    initNetwork()
+    local modem_available = initNetwork()
 
-    -- Run daemon with parallel logging
-    parallel.waitForAny(
-    -- Main daemon loop
-            function()
-                local success, err = pcall(mainLoop)
-                if not success then
-                    logger:error("Main loop error: %s", err)
-                end
-            end,
+    if modem_available then
+        logger:info("Network daemon ready with full functionality")
+    else
+        logger:warn("Network daemon ready with limited functionality (no modem)")
+    end
 
-    -- Parallel log writer (started in logger:init())
-            function()
-                -- The log writer is started in logger:init() via startLogWriter()
-                -- This parallel thread handles the actual file writing
-                while network_state.running and logger.logging_active do
-                    sleep(1) -- Keep this thread alive
-                end
-            end
-    )
+    local success, err = pcall(mainLoop)
+    if not success then
+        logger:error("Main loop error: %s", err)
+    end
 
-    -- Cleanup
     shutdown()
 end
 
