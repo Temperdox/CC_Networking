@@ -74,26 +74,11 @@ local function getProcessPid(pidFile)
 end
 
 local function isProcessRunning(processName)
-    -- Check both PID file and actual process
+    -- Simply check if PID file exists
+    -- In ComputerCraft, if the process is running, it maintains its PID file
+    -- When it stops, it deletes the PID file
     local pidFile = "/var/run/" .. processName .. ".pid"
-    if not fs.exists(pidFile) then return false end
-
-    -- In ComputerCraft, we can't directly check if a process is running
-    -- but we can check if the PID file exists and is recent
-    local pid = getProcessPid(pidFile)
-    if not pid then return false end
-
-    -- Check if PID file was updated recently (within last 30 seconds)
-    local attrs = fs.attributes(pidFile)
-    if attrs and attrs.modified then
-        local age = os.epoch("utc") - attrs.modified
-        if age > 30000 then -- 30 seconds
-            logWarning(processName .. " PID file is stale (age: " .. age .. "ms)")
-            return false
-        end
-    end
-
-    return true
+    return fs.exists(pidFile)
 end
 
 local function killProcess(processName)
@@ -256,9 +241,10 @@ local function handleModemChange(change_type, side, ptype)
         logInfo("Modem added on side: " .. side)
         local modem_available, old = updateNetworkInfo()
 
-        if isNetdRunning() and not old and modem_available then
+        if isNetdRunning() then
+            logInfo("Netd is already running, will restart to use new modem")
             restartNetd("New modem detected - enabling network features")
-        elseif not isNetdRunning() and modem_available then
+        else
             logInfo("Starting netd - modem now available")
             shell.run("bg", "/bin/netd.lua")
         end
@@ -334,10 +320,16 @@ local function watchdogLoop()
                     logInfo(string.format("Hardware check #%d - no changes detected", checks))
                     updateNetworkInfo()
 
-                    -- Health check for netd
+                    -- Health check for netd - only start if not running AND modem exists
                     if not isNetdRunning() and peripheral.find("modem") then
                         logWarning("Netd not running but modem available - starting netd")
                         shell.run("bg", "/bin/netd.lua")
+                        sleep(1) -- Give it a moment to start
+                    elseif isNetdRunning() then
+                        -- Netd is running, all good
+                        if checks % 12 == 0 then  -- Every minute
+                            logInfo("Netd is running normally")
+                        end
                     end
                 end
             end
