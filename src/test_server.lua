@@ -1,13 +1,15 @@
 -- test_server.lua
--- Simple HTTP test server for network demo testing (fixed: responsive + safe terminate)
+-- Simple HTTP test server for network demo testing (fixed logging and terminate handling)
 
 --------------------------
--- Logging (buffered)
+-- Logging (buffered with proper flushing)
 --------------------------
 local LOG_DIR = "logs"
 local LOG_PATH = LOG_DIR .. "/test_server.log"
 
-local log_buffer, log_timer, LOG_FLUSH_EVERY = {}, nil, 0.5 -- seconds
+local log_buffer = {}
+local LOG_FLUSH_INTERVAL = 0.5 -- seconds
+local last_flush = os.clock()
 
 local function ensureLogDir()
     if not fs.exists(LOG_DIR) then fs.makeDir(LOG_DIR) end
@@ -18,10 +20,13 @@ local function flushLogBuffer()
     ensureLogDir()
     local f = fs.open(LOG_PATH, "a")
     if f then
-        for i = 1, #log_buffer do f.writeLine(log_buffer[i]) end
+        for i = 1, #log_buffer do
+            f.writeLine(log_buffer[i])
+        end
         f.close()
     end
     log_buffer = {}
+    last_flush = os.clock()
 end
 
 local function writeLog(message, level)
@@ -30,9 +35,11 @@ local function writeLog(message, level)
     local entry = string.format("[%s] [%s] %s", timestamp, level, message)
     print(entry)                     -- keep console output for visibility
     table.insert(log_buffer, entry)  -- buffer writes
-    -- (Re)start flush timer
-    if log_timer then os.cancelTimer(log_timer) end
-    log_timer = os.startTimer(LOG_FLUSH_EVERY)
+
+    -- Check if we should flush based on time elapsed
+    if os.clock() - last_flush > LOG_FLUSH_INTERVAL then
+        flushLogBuffer()
+    end
 end
 
 local function logInfo(msg)    writeLog(msg, "INFO")    end
@@ -85,115 +92,135 @@ local function createSimpleServer(port)
     local ip = string.format("10.0.%d.%d", math.floor(computerId / 254) % 256, (computerId % 254) + 1)
 
     print("Test server started!")
-    print("  Computer ID: " .. computerId)
-    print("  Hostname:    " .. hostname)
-    print("  IP:          " .. ip)
-    print("  Port:        " .. port)
-    print()
-    print("Server endpoints:")
-    print("  GET /test")
-    print("  GET /info")
-    print("  GET /time")
-    print("  GET /echo?msg=text")
-    print()
-    print("Press Ctrl+T to stop server")
-    print()
+    print(string.format("  Hostname: %s", hostname))
+    print(string.format("  IP: %s", ip))
+    print(string.format("  Port: %d", port))
+    print("Server will be available at:")
+    print(string.format("  http://%s/", hostname))
+    print(string.format("  http://%s:%d/", ip, port))
+    print("Press Ctrl+T to stop the server")
+    print("----------------------------------------")
 
-    logSuccess("Test server ready for connections")
+    logInfo("Test server session started")
+    logInfo("Computer ID: " .. computerId)
+    logInfo("Hostname: " .. hostname)
+    logInfo("IP: " .. ip)
+    logInfo("Port: " .. port)
 
     local running = true
     local request_count = 0
 
-    -- Server loop (event-driven). We wait ONLY for rednet or timer events here.
-    local function serverLoop()
-        while running do
-            local ev, p1, p2, p3, p4, p5 = os.pullEvent() -- block until something happens
-            if ev == "rednet_message" then
-                local sender, message, protocol = p1, p2, p3
-                if protocol == "ccnet_http" and type(message) == "table" and message.type == "request" and message.port == port then
-                    request_count = request_count + 1
-                    local raw_path = message.path or "/"
-                    local path = stripQuery(raw_path)
-                    local method = message.method or "GET"
-                    local query = parseQuery(raw_path)
+    -- Main server loop
+    while running do
+        -- Use pullEventRaw to catch terminate
+        local ev, p1, p2, p3 = os.pullEventRaw()
 
-                    logInfo(("HTTP request #%d: %s %s from computer %d"):format(request_count, method, raw_path, sender))
+        if ev == "terminate" then
+            running = false
+            logInfo("Received terminate signal")
+        elseif ev == "rednet_message" then
+            local sender, message, protocol = p1, p2, p3
 
-                    local response_body, response_code = "", 200
+            -- Check for HTTP requests
+            if protocol == "ccnet_http" and type(message) == "table" and message.type == "request" then
+                request_count = request_count + 1
+                local method = message.method or "GET"
+                local path = message.path or "/"
+                local headers = message.headers or {}
+                local body = message.body or ""
 
-                    if path == "/test" then
-                        response_body = "Test server is working!\nRequest #" .. request_count
+                logInfo(string.format("Request #%d from ID %d: %s %s",
+                        request_count, sender, method, path))
 
-                    elseif path == "/info" then
-                        response_body = table.concat({
-                            "Server Information:",
-                            "Hostname: " .. hostname,
-                            "Computer ID: " .. computerId,
-                            "IP: " .. ip,
-                            "Port: " .. port,
-                            "Uptime: " .. string.format("%.2f", os.clock()) .. " seconds",
-                            "Requests served: " .. request_count
-                        }, "\n")
+                -- Parse the request path
+                local clean_path = stripQuery(path)
+                local query = parseQuery(path)
 
-                    elseif path == "/time" then
-                        response_body = "Current time: " .. os.date() .. "\nEpoch time: " .. os.epoch("utc")
+                -- Prepare response
+                local response_code = 200
+                local response_body = ""
 
-                    elseif path == "/echo" then
-                        local msg = query.msg
-                        response_body = msg and ("Echo: " .. msg) or "Echo service - add ?msg=yourtext"
-
-                    else
-                        response_code = 404
-                        response_body = "Not Found\n\nAvailable endpoints:\n/test\n/info\n/time\n/echo?msg=text"
-                    end
-
-                    local response_packet = {
-                        type = "response",
-                        id = message.id,
-                        code = response_code,
-                        headers = { ["Content-Type"] = "text/plain", ["Server"] = "CC-Test-Server/1.0" },
-                        body = response_body,
-                        timestamp = os.epoch("utc"),
-                    }
-
-                    rednet.send(sender, response_packet, "ccnet_http")
-                    logInfo(("Sent HTTP response: %d (%d bytes)"):format(response_code, #response_body))
+                -- Route handling
+                if clean_path == "/" then
+                    response_body = string.format(
+                            "CC Test Server v1.0\n" ..
+                                    "===================\n" ..
+                                    "Server: %s (%s)\n" ..
+                                    "Uptime: %d seconds\n" ..
+                                    "Requests: %d\n" ..
+                                    "Time: %s\n\n" ..
+                                    "Available endpoints:\n" ..
+                                    "/test - Test endpoint\n" ..
+                                    "/info - Server information\n" ..
+                                    "/time - Current time\n" ..
+                                    "/echo?msg=text - Echo service",
+                            hostname, ip, os.clock(), request_count, os.date()
+                    )
+                elseif clean_path == "/test" then
+                    response_body = "Test successful! Server is responding."
+                elseif clean_path == "/info" then
+                    response_body = textutils.serialiseJSON({
+                        server = "CC-Test-Server/1.0",
+                        hostname = hostname,
+                        ip = ip,
+                        port = port,
+                        requests = request_count,
+                        uptime = os.clock()
+                    })
+                elseif clean_path == "/time" then
+                    response_body = string.format("Server time: %s\nEpoch: %d",
+                            os.date(), os.epoch("utc"))
+                elseif clean_path == "/echo" then
+                    local msg = query.msg or "No message provided"
+                    response_body = "Echo: " .. msg
+                else
+                    response_code = 404
+                    response_body = "404 Not Found\n\nAvailable endpoints:\n/test\n/info\n/time\n/echo?msg=text"
                 end
 
-            elseif ev == "timer" then
-                local tid = p1
-                if log_timer and tid == log_timer then
+                -- Send response
+                local response_packet = {
+                    type = "response",
+                    id = message.id,
+                    code = response_code,
+                    headers = {
+                        ["Content-Type"] = "text/plain",
+                        ["Server"] = "CC-Test-Server/1.0",
+                        ["Content-Length"] = tostring(#response_body)
+                    },
+                    body = response_body,
+                    timestamp = os.epoch("utc"),
+                }
+
+                rednet.send(sender, response_packet, "ccnet_http")
+                logInfo(string.format("Sent HTTP response: %d (%d bytes)",
+                        response_code, #response_body))
+
+                -- Flush logs periodically
+                if request_count % 5 == 0 then
                     flushLogBuffer()
-                    log_timer = nil
                 end
-            elseif ev == "terminate" then
-                -- The terminate event is handled in controlLoop to keep shutdown unified.
-                -- We still drop a yield here so this loop isn’t stuck doing more work.
-                sleep(0)
             end
         end
-    end
 
-    -- Dedicated terminate watcher: ends the server cleanly on Ctrl+T
-    local function controlLoop()
-        while true do
-            local ev = os.pullEventRaw()
-            if ev == "terminate" then
-                running = false
-                break
-            end
+        -- Periodic log flush check (non-blocking)
+        if os.clock() - last_flush > LOG_FLUSH_INTERVAL then
+            flushLogBuffer()
         end
     end
-
-    -- Run both in parallel; whichever returns first stops the other.
-    parallel.waitForAny(serverLoop, controlLoop)
 
     -- Cleanup
     logInfo("Test server shutting down")
+    logInfo(string.format("Total requests handled: %d", request_count))
+    logInfo("Test server session ended")
+    logSuccess("Server stopped gracefully")
+
+    -- Final flush
     flushLogBuffer()
+
     pcall(rednet.unhost, "http_server")
-    -- leave modem open for other programs if it was already open before; otherwise you could close:
-    -- rednet.close(side)
+    print("\n[Test Server] Stopped")
+
     return true
 end
 
@@ -222,57 +249,60 @@ local function main()
             if info then
                 print("Starting HTTP server using network library...")
                 print("Server will be available at:")
-                if info.ip then print("  http://" .. info.ip .. ":" .. port .. "/") end
-                if info.hostname then print("  http://" .. info.hostname .. ".local:" .. port .. "/") end
+                print(string.format("  http://%s:%d/", info.hostname or "unknown", port))
+                print(string.format("  http://%s:%d/", info.ip or "unknown", port))
 
-                local ok_srv, err = pcall(function()
-                    network.createServer(port, function(request)
-                        local path = request.path or "/"
-                        logInfo("HTTP request: " .. (request.method or "GET") .. " " .. path)
-                        if path == "/test" then
-                            return { code = 200, headers = {["Content-Type"]="text/plain"},
-                                     body = "Test server response from " .. (info.hostname or "unknown") }
-                        else
-                            return { code = 200, headers = {["Content-Type"]="text/plain"},
-                                     body = "Hello from " .. (info.hostname or "unknown") .. "!\nEndpoint: " .. path }
-                        end
-                    end)
+                local ok_serve, err = pcall(network.serveHTTP, port, function(request)
+                    logInfo(string.format("Request: %s %s", request.method, request.path))
+
+                    -- Simple routing
+                    local path = stripQuery(request.path)
+                    local query = parseQuery(request.path)
+
+                    if path == "/" then
+                        return 200, "Test Server Running!\n\nAvailable:\n/test\n/info\n/time\n/echo?msg=text"
+                    elseif path == "/test" then
+                        return 200, "Test successful!"
+                    elseif path == "/info" then
+                        return 200, textutils.serialiseJSON(info)
+                    elseif path == "/time" then
+                        return 200, os.date()
+                    elseif path == "/echo" then
+                        return 200, "Echo: " .. (query.msg or "empty")
+                    else
+                        return 404, "Not Found"
+                    end
                 end)
 
-                if ok_srv then
-                    logSuccess("Network library server started successfully")
-                    use_simple = false
-                    -- Wait for terminate to stop
-                    while true do
-                        local ev = os.pullEventRaw()
-                        if ev == "terminate" then break end
-                    end
+                if not ok_serve then
+                    logWarning("Network library HTTP failed: " .. tostring(err))
+                    use_simple = true
                 else
-                    logError("Network library server failed: " .. tostring(err))
+                    use_simple = false
                 end
             else
-                logError("Could not get network info; falling back")
+                logWarning("Could not get network info, using simple server")
             end
         else
-            logWarning("Network daemon not running - falling back to simple server")
+            logWarning("Network daemon not running, using simple server")
         end
     else
-        logWarning("Network library not available - using simple server")
+        logInfo("Network library not available, using simple server")
     end
 
     if use_simple then
+        print("Starting simple HTTP server using rednet...")
         createSimpleServer(port)
     end
 
-    logInfo("Test server session ended")
+    logSuccess("Test server stopped")
+    flushLogBuffer()
 end
 
--- Run server with error handling
-local ok_main, err_main = pcall(main)
-if not ok_main then
-    writeLog("CRITICAL: Test server failed: " .. tostring(err_main), "CRITICAL")
-    print("TEST SERVER FAILURE")
-    print("Error: " .. tostring(err_main))
-    print("Check " .. LOG_PATH .. " for details")
+-- Run with error handling
+local ok, err = pcall(main)
+if not ok then
+    logError("Test server error: " .. tostring(err))
     flushLogBuffer()
+    error(err)
 end
