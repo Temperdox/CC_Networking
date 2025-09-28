@@ -1,298 +1,171 @@
--- hardware_watchdog.lua
+-- hardware_watchdog.lua (quiet + buffered logging)
 -- Hardware monitoring service for ComputerCraft
--- Monitors peripheral changes and updates network configuration
 
 local WATCHDOG_VERSION = "1.0.0"
-local CHECK_INTERVAL = 5 -- seconds between hardware checks
+local CHECK_INTERVAL = 5 -- seconds
 
--- Logging utility
+-- quiet, buffered logging
+local LOG_DIR, LOG_PATH = "logs", "logs/hardware_watchdog.log"
+local PRINT_MIN = "WARN" -- only WARN/ERROR print to console
+local LEVELS = { INFO=3, SUCCESS=3, WARNING=4, WARN=4, ERROR=5, CRITICAL=6 }
+
+local buf, tmr, FLUSH_EVERY = {}, nil, 1.0
+local function sev(n) return LEVELS[(n or "INFO"):upper()] or 3 end
+
+local function flushBuf()
+    if #buf == 0 then return end
+    if not fs.exists(LOG_DIR) then fs.makeDir(LOG_DIR) end
+    local f = fs.open(LOG_PATH,"a")
+    if f then for i=1,#buf do f.writeLine(buf[i]) end f.close() end
+    buf = {}
+end
+
+local function qFlush()
+    if tmr then os.cancelTimer(tmr) end
+    tmr = os.startTimer(FLUSH_EVERY)
+end
+
 local function writeLog(message, level)
     level = level or "INFO"
-    local timestamp = os.date("%Y-%m-%d %H:%M:%S")
-    local log_entry = string.format("[%s] [%s] %s", timestamp, level, message)
-
-    print(log_entry)
-
-    if not fs.exists("logs") then
-        fs.makeDir("logs")
-    end
-
-    local log_file = fs.open("logs/hardware_watchdog.log", "a")
-    if log_file then
-        log_file.writeLine(log_entry)
-        log_file.close()
-    end
+    local ts = os.date("%Y-%m-%d %H:%M:%S")
+    local line = string.format("[%s] [%s] %s", ts, level, message)
+    if sev(level) >= sev(PRINT_MIN) then print(line) end
+    table.insert(buf, line); qFlush()
 end
 
-local function logInfo(msg) writeLog(msg, "INFO") end
+local function logInfo(msg)    writeLog(msg, "INFO")    end
 local function logSuccess(msg) writeLog(msg, "SUCCESS") end
-local function logError(msg) writeLog(msg, "ERROR") end
+local function logError(msg)   writeLog(msg, "ERROR")   end
 local function logWarning(msg) writeLog(msg, "WARNING") end
 
--- Check if netd is running
-local function isNetdRunning()
-    return fs.exists("/var/run/netd.pid")
-end
+local function isNetdRunning() return fs.exists("/var/run/netd.pid") end
 
--- Get current peripheral inventory
 local function getCurrentPeripherals()
-    local peripherals = {}
-    local sides = {"top", "bottom", "left", "right", "front", "back"}
-
-    for _, side in ipairs(sides) do
-        if peripheral.isPresent(side) then
-            local ptype = peripheral.getType(side)
-            peripherals[side] = ptype
-        end
-    end
-
-    return peripherals
+    local p = {}; local sides = {"top","bottom","left","right","front","back"}
+    for _,s in ipairs(sides) do if peripheral.isPresent(s) then p[s]=peripheral.getType(s) end end
+    return p
 end
 
--- Compare peripheral inventories
 local function comparePeripherals(old, new)
-    local changes = {
-        added = {},
-        removed = {},
-        changed = {}
-    }
-
-    -- Check for additions and changes
-    for side, ptype in pairs(new) do
-        if not old[side] then
-            table.insert(changes.added, {side = side, type = ptype})
-        elseif old[side] ~= ptype then
-            table.insert(changes.changed, {side = side, old_type = old[side], new_type = ptype})
-        end
+    local ch = { added={}, removed={}, changed={} }
+    for side, t in pairs(new) do
+        if not old[side] then table.insert(ch.added, {side=side, type=t})
+        elseif old[side] ~= t then table.insert(ch.changed, {side=side, old_type=old[side], new_type=t}) end
     end
-
-    -- Check for removals
-    for side, ptype in pairs(old) do
-        if not new[side] then
-            table.insert(changes.removed, {side = side, type = ptype})
-        end
+    for side, t in pairs(old) do
+        if not new[side] then table.insert(ch.removed, {side=side, type=t}) end
     end
-
-    return changes
+    return ch
 end
 
--- Update network info file
 local function updateNetworkInfo()
-    logInfo("Updating network information...")
-
-    -- Check if we have a modem now
     local modem = peripheral.find("modem")
     local modem_available = modem ~= nil
-
-    -- Load current network info
     local info = {}
     if fs.exists("/var/run/network.info") then
-        local file = fs.open("/var/run/network.info", "r")
-        if file then
-            local content = file.readAll()
-            file.close()
-            info = textutils.unserialize(content) or {}
-        end
+        local f=fs.open("/var/run/network.info","r"); if f then local c=f.readAll(); f.close(); info=textutils.unserialize(c) or {} end
     end
-
-    -- Update modem availability
-    local old_modem_status = info.modem_available
+    local old = info.modem_available
     info.modem_available = modem_available
+    info.modem_side = modem and peripheral.getName(modem) or nil
 
-    if modem_available and modem then
-        info.modem_side = peripheral.getName(modem)
-        logInfo("Modem detected on side: " .. info.modem_side)
+    local w=fs.open("/var/run/network.info","w"); if w then w.write(textutils.serialize(info)); w.close() end
+
+    if old ~= modem_available then
+        logSuccess("Network info updated - modem status changed: " .. tostring(old) .. " -> " .. tostring(modem_available))
     else
-        info.modem_side = nil
-        logWarning("No modem detected")
+        logInfo("Network info updated")
     end
-
-    -- Write updated info
-    local file = fs.open("/var/run/network.info", "w")
-    if file then
-        file.write(textutils.serialize(info))
-        file.close()
-
-        if old_modem_status ~= modem_available then
-            logSuccess("Network info updated - modem status changed: " .. tostring(old_modem_status) .. " -> " .. tostring(modem_available))
-        else
-            logInfo("Network info updated")
-        end
-    end
-
-    return modem_available, old_modem_status
+    return modem_available, old
 end
 
--- Restart netd if needed
 local function restartNetd(reason)
-    logInfo("Restarting netd: " .. reason)
-
-    -- Stop current netd
-    if fs.exists("/var/run/netd.pid") then
-        fs.delete("/var/run/netd.pid")
-        logInfo("Removed netd PID file")
-    end
-
-    -- Wait a moment
+    logWarning("Restarting netd: " .. reason)
+    if fs.exists("/var/run/netd.pid") then fs.delete("/var/run/netd.pid"); logInfo("Removed netd PID file") end
     sleep(1)
-
-    -- Start netd again
-    local success = shell.run("bg", "/bin/netd.lua")
-    if success then
-        logSuccess("Netd restarted successfully")
-
-        -- Wait for it to start
-        sleep(2)
-
-        -- Verify it started
-        if fs.exists("/var/run/netd.pid") then
-            logSuccess("Netd restart verified - PID file created")
-            return true
-        else
-            logError("Netd restart failed - no PID file created")
-            return false
-        end
+    local ok = shell.run("bg", "/bin/netd.lua")
+    if ok then
+        logSuccess("Netd restarted successfully"); sleep(2)
+        if fs.exists("/var/run/netd.pid") then logSuccess("Netd restart verified - PID file created"); return true
+        else logError("Netd restart failed - no PID file created"); return false end
     else
-        logError("Failed to restart netd")
-        return false
+        logError("Failed to restart netd"); return false
     end
 end
 
--- Handle modem changes
 local function handleModemChange(change_type, side, ptype)
-    if ptype == "modem" then
-        if change_type == "added" then
-            logInfo("Modem added on side: " .. side)
-
-            -- Update network info
-            local modem_available, old_status = updateNetworkInfo()
-
-            -- If netd is running and modem status changed, restart netd
-            if isNetdRunning() and not old_status and modem_available then
-                restartNetd("New modem detected - enabling network features")
-            end
-
-        elseif change_type == "removed" then
-            logWarning("Modem removed from side: " .. side)
-
-            -- Update network info
-            local modem_available, old_status = updateNetworkInfo()
-
-            -- If netd is running and we lost the modem, restart with limited functionality
-            if isNetdRunning() and old_status and not modem_available then
-                restartNetd("Modem removed - switching to limited mode")
-            end
-        end
+    if ptype ~= "modem" then return end
+    if change_type == "added" then
+        logInfo("Modem added on side: " .. side)
+        local modem_available, old = updateNetworkInfo()
+        if isNetdRunning() and not old and modem_available then restartNetd("New modem detected - enabling network features") end
+    elseif change_type == "removed" then
+        logWarning("Modem removed from side: " .. side)
+        local modem_available, old = updateNetworkInfo()
+        if isNetdRunning() and old and not modem_available then restartNetd("Modem removed - switching to limited mode") end
     end
 end
 
--- Main watchdog loop
 local function watchdogLoop()
     logInfo("Hardware watchdog started - version " .. WATCHDOG_VERSION)
     logInfo("Monitoring interval: " .. CHECK_INTERVAL .. " seconds")
 
-    -- Get initial peripheral state
-    local current_peripherals = getCurrentPeripherals()
-    logInfo("Initial peripheral scan completed")
+    local current = getCurrentPeripherals()
+    for side, t in pairs(current) do logInfo("Initial: " .. side .. " = " .. t) end
 
-    -- Log initial state
-    for side, ptype in pairs(current_peripherals) do
-        logInfo("Initial: " .. side .. " = " .. ptype)
-    end
-
-    local check_count = 0
-
+    local checks = 0
     while true do
-        sleep(CHECK_INTERVAL)
-        check_count = check_count + 1
-
-        -- Get current peripheral state
-        local new_peripherals = getCurrentPeripherals()
-
-        -- Compare with previous state
-        local changes = comparePeripherals(current_peripherals, new_peripherals)
-
-        -- Log changes
-        if #changes.added > 0 or #changes.removed > 0 or #changes.changed > 0 then
-            logInfo("Hardware changes detected (check #" .. check_count .. "):")
-
-            for _, change in ipairs(changes.added) do
-                logInfo("  ADDED: " .. change.side .. " = " .. change.type)
-                handleModemChange("added", change.side, change.type)
-            end
-
-            for _, change in ipairs(changes.removed) do
-                logWarning("  REMOVED: " .. change.side .. " = " .. change.type)
-                handleModemChange("removed", change.side, change.type)
-            end
-
-            for _, change in ipairs(changes.changed) do
-                logInfo("  CHANGED: " .. change.side .. " = " .. change.old_type .. " -> " .. change.new_type)
-                handleModemChange("removed", change.side, change.old_type)
-                handleModemChange("added", change.side, change.new_type)
-            end
-        else
-            -- Periodic status log (every 10 checks)
-            if check_count % 10 == 0 then
-                logInfo("Hardware check #" .. check_count .. " - no changes detected")
-            end
+        -- use event loop to keep Ctrl+T responsive and handle log flush timer
+        local ev, p1 = os.pullEvent()
+        if ev == "timer" and tmr and p1 == tmr then
+            flushBuf(); tmr = nil
+        elseif ev == "terminate" then
+            error("terminate") -- allow outer pcall to run cleanup
         end
 
-        -- Update current state
-        current_peripherals = new_peripherals
+        -- periodically do work
+        if checks == 0 or (os.clock() % CHECK_INTERVAL) < 0.05 then
+            checks = checks + 1
+            local new = getCurrentPeripherals()
+            local ch = comparePeripherals(current, new)
 
-        -- Also periodically update network info even without changes
-        if check_count % 12 == 0 then -- Every minute
-            updateNetworkInfo()
+            if #ch.added>0 or #ch.removed>0 or #ch.changed>0 then
+                logInfo(("Hardware changes detected (check #%d):"):format(checks))
+                for _,c in ipairs(ch.added) do logInfo("  ADDED: " .. c.side .. " = " .. c.type); handleModemChange("added", c.side, c.type) end
+                for _,c in ipairs(ch.removed) do logWarning("  REMOVED: " .. c.side .. " = " .. c.type); handleModemChange("removed", c.side, c.type) end
+                for _,c in ipairs(ch.changed) do
+                    logInfo("  CHANGED: " .. c.side .. " = " .. c.old_type .. " -> " .. c.new_type)
+                    handleModemChange("removed", c.side, c.old_type); handleModemChange("added", c.side, c.new_type)
+                end
+                current = new
+            elseif checks % 12 == 0 then
+                logInfo("Hardware check #" .. checks .. " - no changes detected")
+                updateNetworkInfo()
+            end
         end
     end
 end
 
--- Write PID file for watchdog
 local function writePID()
-    if not fs.exists("/var/run") then
-        fs.makeDir("/var/run")
-    end
-
-    local pid_file = fs.open("/var/run/hardware_watchdog.pid", "w")
-    if pid_file then
-        pid_file.write(tostring(os.getComputerID()))
-        pid_file.close()
-        logInfo("Watchdog PID file created")
-    end
+    if not fs.exists("/var/run") then fs.makeDir("/var/run") end
+    local f=fs.open("/var/run/hardware_watchdog.pid","w"); if f then f.write(tostring(os.getComputerID())); f.close(); logInfo("Watchdog PID file created") end
 end
 
--- Cleanup on exit
 local function cleanup()
     logInfo("Hardware watchdog shutting down")
-
-    if fs.exists("/var/run/hardware_watchdog.pid") then
-        fs.delete("/var/run/hardware_watchdog.pid")
-        logInfo("Removed watchdog PID file")
-    end
+    if fs.exists("/var/run/hardware_watchdog.pid") then fs.delete("/var/run/hardware_watchdog.pid"); logInfo("Removed watchdog PID file") end
+    flushBuf()
 end
 
--- Main execution
 local function main()
     print("Hardware Watchdog v" .. WATCHDOG_VERSION)
     print("Monitoring hardware changes...")
 
     writePID()
-
-    -- Handle termination gracefully
-    local success, err = pcall(watchdogLoop)
-    if not success then
-        logError("Watchdog loop error: " .. tostring(err))
-    end
-
+    local ok, err = pcall(watchdogLoop)
+    if not ok and tostring(err) ~= "terminate" then logError("Watchdog loop error: " .. tostring(err)) end
     cleanup()
 end
 
--- Check if already running
-if fs.exists("/var/run/hardware_watchdog.pid") then
-    print("Hardware watchdog already running")
-    return
-end
-
--- Start the watchdog
+if fs.exists("/var/run/hardware_watchdog.pid") then print("Hardware watchdog already running"); return end
 main()
