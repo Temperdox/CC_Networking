@@ -6,6 +6,7 @@ local STARTUP_CONFIG = {
     enableNetd = true,
     enableLogger = false,
     netdBackground = true,
+    hardwareWatchdog = true,
     showNetInfo = true,
     startupDelay = 0.5,
 }
@@ -232,6 +233,39 @@ local function startNetd()
     return true
 end
 
+local function startHardwareWatchdog()
+    if not fileExists("hardware_watchdog.lua") then
+        print("Warning: hardware_watchdog not found at hardware_watchdog.lua")
+        return false
+    end
+
+    -- Check if already running
+    if fileExists("/var/run/hardware_watchdog.pid") then
+        print("hardware_watchdog appears to be already running")
+        return true
+    end
+
+    local success, error = pcall(function()
+        if STARTUP_CONFIG.hardwareWatchdog then
+            -- Start in background using shell
+            shell.run("bg", "hardware_watchdog.lua")
+            logInfo("Hardware watchdog daemon started in background mode")
+        else
+            -- Start in foreground (blocks)
+            shell.run("hardware_watchdog.lua")
+            logInfo("Hardware watchdog started in foreground mode")
+        end
+    end)
+
+    if not success then
+        logError("Failed to start Hardware watchdog daemon", error)
+        return false
+    end
+
+    logSuccess("Hardware watchdog daemon startup completed")
+    return true
+end
+
 -- Show network information
 local function showNetworkInfo()
     logInfo("Displaying network information...")
@@ -325,6 +359,10 @@ local function main()
     -- Show network info if enabled
     if STARTUP_CONFIG.showNetInfo then
         showNetworkInfo()
+    end
+
+    if STARTUP_CONFIG.hardwareWatchdog then
+        startHardwareWatchdog()
     end
 
     -- Run user startup file if it exists
