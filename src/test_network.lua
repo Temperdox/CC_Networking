@@ -1,6 +1,6 @@
 -- test_network.lua
--- Main network protocol testing menu system with server launcher integration
--- Allows testing of all implemented network protocols and managing test servers
+-- Main network protocol testing menu system
+-- ComputerCraft compatible version with server launcher integration
 
 local function printHeader(text)
     term.clear()
@@ -20,7 +20,7 @@ local function printColored(text, color)
     end
 end
 
--- Protocol list with display names, test files, and actual protocol file locations
+-- Protocol definitions with correct file paths
 local PROTOCOLS = {
     {id = "websocket", name = "WebSocket", file = "/tests/test_websocket.lua", protocol_file = "/protocols/websocket.lua"},
     {id = "http_client", name = "HTTP", file = "/tests/test_http.lua", protocol_file = "/protocols/http_client.lua"},
@@ -33,38 +33,58 @@ local PROTOCOLS = {
     {id = "ssh", name = "SSH", file = "/tests/test_ssh.lua", protocol_file = "/protocols/ssh.lua"}
 }
 
--- Server launcher and test client integration
+-- Global state for test components
 local serverLauncher = nil
 local testClient = nil
 
--- Load server launcher and test client if available
+-- Ensure required directories exist
+local function ensureDirectories()
+    local dirs = {"/tests", "/tests/servers", "/var/log", "/var/run"}
+    for _, dir in ipairs(dirs) do
+        if not fs.exists(dir) then
+            fs.makeDir(dir)
+        end
+    end
+end
+
+-- Load test components safely
 local function loadTestComponents()
     printHeader("Loading Test Components")
 
+    -- Reset components
+    serverLauncher = nil
+    testClient = nil
+
     -- Try to load server launcher
     if fs.exists("/tests/servers/launcher.lua") then
-        local ok, launcher = pcall(dofile, "/tests/servers/launcher.lua")
-        if ok and launcher then
-            serverLauncher = launcher
-            printColored("✓ Server launcher available", colors.green)
+        local success, result = pcall(dofile, "/tests/servers/launcher.lua")
+        if success and type(result) == "table" then
+            serverLauncher = result
+            printColored("Server launcher: OK", colors.green)
         else
-            printColored("⚠ Server launcher failed to load: " .. tostring(launcher), colors.yellow)
+            printColored("Server launcher: Failed to load", colors.yellow)
+            if result then
+                print("Error: " .. tostring(result))
+            end
         end
     else
-        printColored("⚠ Server launcher not found (/tests/servers/launcher.lua)", colors.yellow)
+        printColored("Server launcher: Not found", colors.gray)
     end
 
     -- Try to load test client
     if fs.exists("/tests/test_client.lua") then
-        local ok, client = pcall(dofile, "/tests/test_client.lua")
-        if ok and client then
-            testClient = client
-            printColored("✓ Test client available", colors.green)
+        local success, result = pcall(dofile, "/tests/test_client.lua")
+        if success and type(result) == "table" then
+            testClient = result
+            printColored("Test client: OK", colors.green)
         else
-            printColored("⚠ Test client failed to load: " .. tostring(client), colors.yellow)
+            printColored("Test client: Failed to load", colors.yellow)
+            if result then
+                print("Error: " .. tostring(result))
+            end
         end
     else
-        printColored("⚠ Test client not found (/tests/test_client.lua)", colors.yellow)
+        printColored("Test client: Not found", colors.gray)
     end
 
     print("\nPress any key to continue...")
@@ -73,107 +93,86 @@ end
 
 -- Check system status
 local function checkSystemStatus()
-    local status = {
-        modem = peripheral.find("modem") ~= nil,
-        netd = fs.exists("/var/run/netd.pid"),
-        network_lib = fs.exists("/lib/network.lua"),
-        protocols_dir = fs.exists("/protocols"),
-        tests_dir = fs.exists("/tests"),
-        basalt = pcall(require, "basalt"),
-        rednet_open = rednet.isOpen()
-    }
-
     printHeader("System Status Check")
     print()
 
-    printColored("Core Components:", colors.cyan)
-    printColored(string.format("  [%s] Modem Available",
-            status.modem and "OK" or "FAIL"),
-            status.modem and colors.green or colors.red)
+    -- Core system checks
+    printColored("System Components:", colors.cyan)
 
-    printColored(string.format("  [%s] Rednet Open",
-            status.rednet_open and "OK" or "FAIL"),
-            status.rednet_open and colors.green or colors.red)
+    local modem = peripheral.find("modem")
+    printColored(string.format("  Modem: %s", modem and "OK" or "FAIL"),
+            modem and colors.green or colors.red)
 
-    printColored(string.format("  [%s] Network Daemon (netd)",
-            status.netd and "OK" or "FAIL"),
-            status.netd and colors.green or colors.red)
+    local rednetOpen = rednet.isOpen()
+    printColored(string.format("  Rednet: %s", rednetOpen and "Open" or "Closed"),
+            rednetOpen and colors.green or colors.orange)
 
-    printColored(string.format("  [%s] Network Library",
-            status.network_lib and "OK" or "FAIL"),
-            status.network_lib and colors.green or colors.red)
+    -- Network components
+    print()
+    printColored("Network Infrastructure:", colors.cyan)
 
-    printColored(string.format("  [%s] Protocols Directory",
-            status.protocols_dir and "OK" or "FAIL"),
-            status.protocols_dir and colors.green or colors.red)
+    local netd = fs.exists("/var/run/netd.pid")
+    printColored(string.format("  Network Daemon: %s", netd and "Running" or "Stopped"),
+            netd and colors.green or colors.red)
 
-    printColored(string.format("  [%s] Tests Directory",
-            status.tests_dir and "OK" or "FAIL"),
-            status.tests_dir and colors.green or colors.red)
+    local networkLib = fs.exists("/lib/network.lua")
+    printColored(string.format("  Network Library: %s", networkLib and "OK" or "Missing"),
+            networkLib and colors.green or colors.yellow)
 
-    printColored(string.format("  [%s] Basalt GUI Framework",
-            status.basalt and "OK" or "FAIL"),
-            status.basalt and colors.green or colors.red)
+    local protocolsDir = fs.exists("/protocols")
+    printColored(string.format("  Protocols Directory: %s", protocolsDir and "OK" or "Missing"),
+            protocolsDir and colors.green or colors.red)
 
+    -- GUI framework
+    local basalt = fs.exists("basalt.lua")
+    printColored(string.format("  Basalt Framework: %s", basalt and "OK" or "Missing"),
+            basalt and colors.green or colors.yellow)
+
+    -- Test infrastructure
     print()
     printColored("Test Infrastructure:", colors.cyan)
-    printColored(string.format("  [%s] Server Launcher",
-            serverLauncher and "OK" or "NOT LOADED"),
+
+    printColored(string.format("  Server Launcher: %s", serverLauncher and "Loaded" or "Not Available"),
             serverLauncher and colors.green or colors.yellow)
 
-    printColored(string.format("  [%s] Test Client",
-            testClient and "OK" or "NOT LOADED"),
+    printColored(string.format("  Test Client: %s", testClient and "Loaded" or "Not Available"),
             testClient and colors.green or colors.yellow)
 
+    -- Protocol availability
     print()
-    printColored("Protocol Availability:", colors.cyan)
+    printColored("Protocol Status:", colors.cyan)
 
-    -- Check each protocol
     for _, proto in ipairs(PROTOCOLS) do
-        local protocol_file = proto.protocol_file
-        local test_file = proto.file
-        local protocol_exists = fs.exists(protocol_file)
-        local test_exists = fs.exists(test_file)
+        local protocolExists = fs.exists(proto.protocol_file)
+        local testExists = fs.exists(proto.file)
 
-        local status_text = "Not Installed"
-        local status_color = colors.red
+        local status = "Not Available"
+        local color = colors.red
 
-        if protocol_exists and test_exists then
-            status_text = "Ready"
-            status_color = colors.green
-        elseif protocol_exists then
-            status_text = "No Test"
-            status_color = colors.yellow
-        elseif test_exists then
-            status_text = "No Protocol"
-            status_color = colors.orange
+        if protocolExists and testExists then
+            status = "Ready"
+            color = colors.green
+        elseif protocolExists then
+            status = "No Test File"
+            color = colors.yellow
+        elseif testExists then
+            status = "Protocol Missing"
+            color = colors.orange
         end
 
-        printColored(string.format("  %-12s: %s", proto.name, status_text), status_color)
+        printColored(string.format("  %-12s: %s", proto.name, status), color)
     end
 
-    print()
-    return status
+    print("\nPress any key to continue...")
+    os.pullEvent("key")
 end
 
--- Create test directory if it doesn't exist
-local function ensureTestDirectory()
-    if not fs.exists("/tests") then
-        fs.makeDir("/tests")
-        printColored("Created /tests directory", colors.green)
-    end
-    if not fs.exists("/tests/servers") then
-        fs.makeDir("/tests/servers")
-        printColored("Created /tests/servers directory", colors.green)
-    end
-end
-
--- Create a basic test file for a protocol if it doesn't exist
+-- Create a basic test file for a protocol
 local function createBasicTestFile(protocol)
-    local protocol_file = protocol.protocol_file
-    local testCode = string.format([[
--- test_%s.lua
--- Test script for %s protocol
+    local testTemplate = string.format([[
+-- %s
+-- Test file for %s protocol
+-- Auto-generated by test_network.lua
 
 local function printHeader(text)
     print("\n" .. string.rep("=", 40))
@@ -194,392 +193,427 @@ end
 local function test_%s()
     printHeader("%s Protocol Test")
 
-    -- Check if protocol exists
-    local protocol_file = "%s"
-    if not fs.exists(protocol_file) then
-        printColored("\nERROR: %s protocol not installed!", colors.red)
+    -- Check if protocol file exists
+    local protocolFile = "%s"
+    if not fs.exists(protocolFile) then
+        printColored("ERROR: Protocol not found!", colors.red)
+        print("Expected location: " .. protocolFile)
         print("Please install the protocol first.")
-        print("Expected location: " .. protocol_file)
         return false
     end
 
-    -- Load protocol
-    local success, protocol_module = pcall(dofile, protocol_file)
+    -- Try to load the protocol
+    local success, protocolModule = pcall(dofile, protocolFile)
     if not success then
-        printColored("\nERROR: Failed to load %s protocol", colors.red)
-        print("Error: " .. tostring(protocol_module))
+        printColored("ERROR: Failed to load protocol!", colors.red)
+        print("Load error: " .. tostring(protocolModule))
         return false
     end
 
-    printColored("\n%s protocol loaded successfully!", colors.green)
+    printColored("Protocol loaded successfully!", colors.green)
 
-    -- Basic protocol validation
-    if type(protocol_module) == "table" then
-        printColored("Protocol appears to be a valid module", colors.green)
-
-        -- List available functions if it's a table
-        print("\nAvailable functions/properties:")
+    -- Basic validation
+    if type(protocolModule) == "table" then
+        print("\nProtocol module contents:")
         local count = 0
-        for key, value in pairs(protocol_module) do
-            if type(value) == "function" then
-                print("  " .. key .. "() - function")
-            else
-                print("  " .. key .. " - " .. type(value))
-            end
+        for key, value in pairs(protocolModule) do
+            local valueType = type(value)
+            print(string.format("  %%s: %%s", key, valueType))
             count = count + 1
         end
 
-        if count == 0 then
-            printColored("Warning: No functions or properties found", colors.yellow)
+        if count > 0 then
+            printColored(string.format("Found %%d properties/functions", count), colors.green)
         else
-            printColored("Found " .. count .. " properties/functions", colors.green)
+            printColored("Warning: Empty protocol module", colors.yellow)
         end
     else
-        printColored("Protocol module type: " .. type(protocol_module), colors.yellow)
+        printColored("Protocol module type: " .. type(protocolModule), colors.cyan)
     end
 
-    -- TODO: Add specific tests for %s protocol
-    printColored("\nBasic validation completed", colors.green)
-    print("Specific protocol tests not yet implemented.")
-    print("Add protocol-specific tests to this file for comprehensive testing.")
+    -- TODO: Add specific protocol tests here
+    printColored("\nBasic protocol validation completed", colors.green)
+    print("TODO: Implement specific " .. "%s" .. " protocol tests")
 
     return true
 end
 
--- Main test function
+-- Main test execution
 local function main()
     local success = test_%s()
 
-    print("\nTest Result: " .. (success and "PASSED" or "FAILED"))
+    print(string.rep("-", 40))
+    if success then
+        printColored("TEST PASSED", colors.green)
+    else
+        printColored("TEST FAILED", colors.red)
+    end
+
     print("\nPress any key to return to menu...")
     os.pullEvent("key")
 end
 
+-- Run the test
 main()
-]], protocol.id, protocol.name, protocol.id, protocol.name,
-            protocol_file, protocol.name, protocol.name, protocol.name, protocol.id)
+]], protocol.file, protocol.name, protocol.id, protocol.name,
+            protocol.protocol_file, protocol.name, protocol.id)
 
+    -- Create directory if it doesn't exist
+    local dir = fs.getDir(protocol.file)
+    if dir ~= "" and not fs.exists(dir) then
+        fs.makeDir(dir)
+    end
+
+    -- Write the test file
     local file = fs.open(protocol.file, "w")
     if file then
-        file.write(testCode)
+        file.write(testTemplate)
         file.close()
         return true
     end
+
     return false
 end
 
--- Run a protocol test
+-- Run a single protocol test
 local function runProtocolTest(protocol)
-    printHeader("Running " .. protocol.name .. " Test")
+    printHeader("Testing " .. protocol.name .. " Protocol")
 
     -- Check if test file exists
     if not fs.exists(protocol.file) then
-        print()
-        printColored("Test file not found: " .. protocol.file, colors.yellow)
-        print("\nWould you like to create a basic test file? (y/n)")
-        local answer = read()
+        print("\nTest file not found: " .. protocol.file)
+        print("Would you like to create a basic test file? (y/n)")
 
+        local answer = read()
         if answer:lower() == "y" then
+            print("Creating test file...")
             if createBasicTestFile(protocol) then
-                printColored("Created basic test file: " .. protocol.file, colors.green)
-                print("\nPress any key to run the test...")
-                os.pullEvent("key")
+                printColored("Test file created successfully!", colors.green)
+                print("\nRunning test...")
+                sleep(1)
             else
-                printColored("Failed to create test file", colors.red)
+                printColored("Failed to create test file!", colors.red)
                 print("\nPress any key to return...")
                 os.pullEvent("key")
                 return
             end
         else
-            print("\nPress any key to return...")
-            os.pullEvent("key")
             return
         end
     end
 
-    -- Check if protocol exists
-    local protocol_file = protocol.protocol_file
-    if not fs.exists(protocol_file) then
-        print()
-        printColored("Warning: Protocol not installed: " .. protocol_file, colors.yellow)
-        print("Test may fail without the protocol implementation.")
+    -- Warn if protocol doesn't exist
+    if not fs.exists(protocol.protocol_file) then
+        printColored("Warning: Protocol file not found!", colors.yellow)
+        print("Location: " .. protocol.protocol_file)
+        print("Test may fail without the protocol.")
         print("\nContinue anyway? (y/n)")
+
         local answer = read()
         if answer:lower() ~= "y" then
             return
         end
     end
 
-    -- Run the test
-    print("\nStarting test...")
-    sleep(1)
-
-    -- Execute test file
+    -- Execute the test
+    print("\nExecuting test...")
     local success, error = pcall(function()
         shell.run(protocol.file)
     end)
 
     if not success then
-        print()
-        printColored("Test failed with error:", colors.red)
-        print(error)
+        print("\nTest execution failed!")
+        printColored("Error: " .. tostring(error), colors.red)
         print("\nPress any key to return...")
         os.pullEvent("key")
     end
 end
 
--- Server management functions
+-- Server management interface
 local function manageServers()
     if not serverLauncher then
         printHeader("Server Management")
         printColored("Server launcher not available!", colors.red)
-        print("Please ensure /tests/servers/launcher.lua exists and is working.")
-        print("\nPress any key to return...")
-        os.pullEvent("key")
+        print("\nOptions:")
+        print("1. Try to load server launcher")
+        print("2. Return to main menu")
+        print("\nChoice: ")
+
+        local choice = read()
+        if choice == "1" then
+            loadTestComponents()
+        end
         return
     end
 
     printHeader("Test Server Management")
-    print()
-    printColored("Available servers:", colors.cyan)
 
+    -- Get server configurations
     local servers = serverLauncher.serverConfigs or {}
-    for serverType, config in pairs(servers) do
-        local statusColor = config.status == "running" and colors.green or colors.red
-        printColored(string.format("  %-12s: %s (Port %d)",
-                config.name, config.status, config.port), statusColor)
-    end
-
-    print()
-    print("1. Start All Servers")
-    print("2. Stop All Servers")
-    print("3. Server Status")
-    print("4. Launch Full GUI")
-    print("5. Return to Main Menu")
-    print()
-    print("Enter your choice: ")
-
-    local choice = read()
-
-    if choice == "1" then
-        print("Starting all servers...")
-        for serverType, _ in pairs(servers) do
-            local success, message = serverLauncher.startServer(serverType)
-            local color = success and colors.green or colors.red
-            printColored(servers[serverType].name .. ": " .. message, color)
-        end
-        print("\nPress any key to continue...")
-        os.pullEvent("key")
-
-    elseif choice == "2" then
-        print("Stopping all servers...")
-        for serverType, _ in pairs(servers) do
-            local success, message = serverLauncher.stopServer(serverType)
-            local color = success and colors.green or colors.red
-            printColored(servers[serverType].name .. ": " .. message, color)
-        end
-        print("\nPress any key to continue...")
-        os.pullEvent("key")
-
-    elseif choice == "3" then
-        printHeader("Server Status Details")
-        for serverType, config in pairs(servers) do
-            print()
-            printColored(config.name .. ":", colors.cyan)
-            local stats = serverLauncher.getServerStats(serverType)
-            for key, value in pairs(stats) do
-                print("  " .. key .. ": " .. tostring(value))
-            end
-        end
-        print("\nPress any key to continue...")
-        os.pullEvent("key")
-
-    elseif choice == "4" then
-        printColored("Launching server GUI...", colors.green)
-        print("Note: This will exit the current menu.")
-        print("Continue? (y/n)")
-        local answer = read()
-        if answer:lower() == "y" then
-            shell.run("/tests/servers/launcher.lua")
-        end
-
-    elseif choice ~= "5" then
-        printColored("Invalid choice. Please try again.", colors.red)
-        sleep(1)
-    end
-end
-
--- Run comprehensive network tests
-local function runComprehensiveTests()
-    if not testClient then
-        printHeader("Comprehensive Network Tests")
-        printColored("Test client not available!", colors.red)
-        print("Please ensure /tests/test_client.lua exists and is working.")
+    if next(servers) == nil then
+        printColored("No servers configured!", colors.yellow)
         print("\nPress any key to return...")
         os.pullEvent("key")
         return
     end
 
-    printHeader("Running Comprehensive Network Tests")
-    print("This will test HTTP, WebSocket, and UDP protocols")
+    -- Display server status
+    print("\nServer Status:")
+    for serverType, config in pairs(servers) do
+        local status = config.status or "unknown"
+        local color = status == "running" and colors.green or colors.red
+        printColored(string.format("  %-15s: %s (Port %d)",
+                config.name or serverType, status, config.port or 0), color)
+    end
+
+    -- Management options
+    print("\nManagement Options:")
+    print("1. Start All Servers")
+    print("2. Stop All Servers")
+    print("3. Server Details")
+    print("4. Launch Server GUI")
+    print("5. Return to Main Menu")
+    print("\nChoice: ")
+
+    local choice = read()
+
+    if choice == "1" then
+        print("\nStarting all servers...")
+        for serverType, _ in pairs(servers) do
+            if serverLauncher.startServer then
+                local success, message = serverLauncher.startServer(serverType)
+                local color = success and colors.green or colors.red
+                printColored(string.format("%s: %s", servers[serverType].name, message or "Unknown result"), color)
+            end
+        end
+
+    elseif choice == "2" then
+        print("\nStopping all servers...")
+        for serverType, _ in pairs(servers) do
+            if serverLauncher.stopServer then
+                local success, message = serverLauncher.stopServer(serverType)
+                local color = success and colors.green or colors.red
+                printColored(string.format("%s: %s", servers[serverType].name, message or "Unknown result"), color)
+            end
+        end
+
+    elseif choice == "3" then
+        printHeader("Server Details")
+        for serverType, config in pairs(servers) do
+            print("\n" .. string.rep("-", 30))
+            printColored(config.name or serverType, colors.cyan)
+
+            if serverLauncher.getServerStats then
+                local stats = serverLauncher.getServerStats(serverType)
+                for key, value in pairs(stats) do
+                    print(string.format("  %s: %s", key, tostring(value)))
+                end
+            else
+                print("  No statistics available")
+            end
+        end
+
+    elseif choice == "4" then
+        printColored("Launching server management GUI...", colors.green)
+        print("This will exit the current menu.")
+        print("Continue? (y/n)")
+
+        local answer = read()
+        if answer:lower() == "y" then
+            shell.run("/tests/servers/launcher.lua")
+            return
+        end
+    end
+
+    if choice ~= "5" then
+        print("\nPress any key to continue...")
+        os.pullEvent("key")
+    end
+end
+
+-- Comprehensive network testing
+local function runComprehensiveTests()
+    if not testClient then
+        printHeader("Comprehensive Network Tests")
+        printColored("Test client not available!", colors.red)
+        print("\nThe comprehensive test requires the test client.")
+        print("Try loading test components first (option L).")
+        print("\nPress any key to return...")
+        os.pullEvent("key")
+        return
+    end
+
+    printHeader("Comprehensive Network Testing")
+    print("This will run tests for HTTP, WebSocket, and UDP protocols")
     print("using the integrated test client.")
-    print()
-    print("Continue? (y/n)")
+    print("\nNote: Make sure test servers are running first.")
+    print("\nContinue? (y/n)")
 
     local answer = read()
     if answer:lower() ~= "y" then
         return
     end
 
-    print()
-    printColored("Starting comprehensive tests...", colors.cyan)
-
-    -- Run HTTP tests
-    print("\n" .. string.rep("-", 40))
-    printColored("Testing HTTP Protocol", colors.yellow)
-    local httpResults = testClient.testHTTP()
-
-    -- Run WebSocket tests
-    print("\n" .. string.rep("-", 40))
-    printColored("Testing WebSocket Protocol", colors.yellow)
-    local wsResults = testClient.testWebSocket()
-
-    -- Run UDP tests
-    print("\n" .. string.rep("-", 40))
-    printColored("Testing UDP Protocol", colors.yellow)
-    local udpResults = testClient.testUDP()
-
-    -- Display results summary
     print("\n" .. string.rep("=", 50))
-    printColored("COMPREHENSIVE TEST RESULTS", colors.cyan)
+    printColored("STARTING COMPREHENSIVE TESTS", colors.cyan)
     print(string.rep("=", 50))
 
-    -- HTTP Results
-    print("\nHTTP Tests:")
-    if httpResults and #httpResults > 0 then
-        for _, result in ipairs(httpResults) do
-            local color = result.success and colors.green or colors.red
-            local status = result.success and "PASS" or "FAIL"
-            printColored("  " .. result.endpoint .. ": " .. status, color)
+    -- Test HTTP
+    if testClient.testHTTP then
+        print("\n" .. string.rep("-", 40))
+        printColored("Testing HTTP Protocol", colors.yellow)
+        local httpResults = testClient.testHTTP()
+
+        if httpResults and type(httpResults) == "table" then
+            for _, result in ipairs(httpResults) do
+                if type(result) == "table" and result.endpoint then
+                    local status = result.success and "PASS" or "FAIL"
+                    local color = result.success and colors.green or colors.red
+                    printColored(string.format("  %s: %s", result.endpoint, status), color)
+                end
+            end
+        else
+            printColored("  HTTP test returned no results", colors.yellow)
         end
     else
-        printColored("  No HTTP results", colors.yellow)
+        printColored("  HTTP test function not available", colors.red)
     end
 
-    -- WebSocket Results
-    print("\nWebSocket Tests:")
-    if wsResults and wsResults.error then
-        printColored("  ERROR: " .. wsResults.error, colors.red)
-    elseif wsResults and #wsResults > 0 then
-        for _, result in ipairs(wsResults) do
-            local color = result.success and colors.green or colors.red
-            local status = result.success and "PASS" or "FAIL"
-            printColored("  " .. result.command .. ": " .. status, color)
+    -- Test WebSocket
+    if testClient.testWebSocket then
+        print("\n" .. string.rep("-", 40))
+        printColored("Testing WebSocket Protocol", colors.yellow)
+        local wsResults = testClient.testWebSocket()
+
+        if wsResults and type(wsResults) == "table" then
+            if wsResults.error then
+                printColored("  ERROR: " .. wsResults.error, colors.red)
+            else
+                for _, result in ipairs(wsResults) do
+                    if type(result) == "table" and result.command then
+                        local status = result.success and "PASS" or "FAIL"
+                        local color = result.success and colors.green or colors.red
+                        printColored(string.format("  %s: %s", result.command, status), color)
+                    end
+                end
+            end
+        else
+            printColored("  WebSocket test returned no results", colors.yellow)
         end
     else
-        printColored("  No WebSocket results", colors.yellow)
+        printColored("  WebSocket test function not available", colors.red)
     end
 
-    -- UDP Results
-    print("\nUDP Tests:")
-    if udpResults and udpResults.error then
-        printColored("  ERROR: " .. udpResults.error, colors.red)
-    elseif udpResults and #udpResults > 0 then
-        for _, result in ipairs(udpResults) do
-            local color = result.success and colors.green or colors.red
-            local status = result.success and "PASS" or "FAIL"
-            local desc = result.command or result.service
-            printColored("  " .. desc .. ": " .. status, color)
+    -- Test UDP
+    if testClient.testUDP then
+        print("\n" .. string.rep("-", 40))
+        printColored("Testing UDP Protocol", colors.yellow)
+        local udpResults = testClient.testUDP()
+
+        if udpResults and type(udpResults) == "table" then
+            if udpResults.error then
+                printColored("  ERROR: " .. udpResults.error, colors.red)
+            else
+                for _, result in ipairs(udpResults) do
+                    if type(result) == "table" then
+                        local desc = result.command or result.service or "unknown"
+                        local status = result.success and "PASS" or "FAIL"
+                        local color = result.success and colors.green or colors.red
+                        printColored(string.format("  %s: %s", desc, status), color)
+                    end
+                end
+            end
+        else
+            printColored("  UDP test returned no results", colors.yellow)
         end
     else
-        printColored("  No UDP results", colors.yellow)
+        printColored("  UDP test function not available", colors.red)
     end
 
-    print("\nPress any key to return to menu...")
+    print("\n" .. string.rep("=", 50))
+    printColored("COMPREHENSIVE TESTS COMPLETED", colors.cyan)
+    print(string.rep("=", 50))
+    print("\nPress any key to return...")
     os.pullEvent("key")
 end
 
--- Show main menu
+-- Main menu system
 local function showMainMenu()
     while true do
         printHeader("Network Protocol Test Suite")
         print()
-        printColored("Select a protocol to test:", colors.cyan)
-        print()
+        printColored("Protocol Tests:", colors.cyan)
 
-        -- Display protocol options
+        -- List protocols with status
         for i, proto in ipairs(PROTOCOLS) do
-            local protocol_file = proto.protocol_file
-            local test_file = proto.file
-            local status = ""
+            local protocolExists = fs.exists(proto.protocol_file)
+            local testExists = fs.exists(proto.file)
 
-            if fs.exists(protocol_file) and fs.exists(test_file) then
+            local status = "[Not Available]"
+            if protocolExists and testExists then
                 status = "[Ready]"
-            elseif fs.exists(protocol_file) then
+            elseif protocolExists then
                 status = "[No Test]"
-            elseif fs.exists(test_file) then
+            elseif testExists then
                 status = "[No Protocol]"
-            else
-                status = "[Not Available]"
             end
 
             print(string.format("%d. %-12s %s", i, proto.name, status))
         end
 
+        -- Additional options
         print()
-        printColored("Additional Options:", colors.cyan)
+        printColored("System Options:", colors.cyan)
         print("S. System Status Check")
         print("A. Run All Available Tests")
         print("C. Create Missing Test Files")
+        print()
+        printColored("Server Options:", colors.cyan)
         print("M. Manage Test Servers")
         print("T. Comprehensive Network Tests")
         print("G. Launch Test Client GUI")
-        print("L. Load Test Components")
+        print()
+        printColored("Utility Options:", colors.cyan)
+        print("L. Load/Reload Test Components")
         print("Q. Quit")
         print()
         print("Enter your choice: ")
 
         local choice = read():lower()
 
+        -- Handle menu choices
         if choice == "q" then
             printHeader("Exiting Test Suite")
-            print("\nThank you for testing!")
+            printColored("Thank you for using the Network Protocol Test Suite!", colors.green)
             break
 
         elseif choice == "s" then
             checkSystemStatus()
-            print("\nPress any key to continue...")
-            os.pullEvent("key")
 
         elseif choice == "a" then
-            -- Run all available tests
             printHeader("Running All Available Tests")
             local testsRun = 0
 
             for _, proto in ipairs(PROTOCOLS) do
-                local protocol_file = proto.protocol_file
-                if fs.exists(proto.file) and fs.exists(protocol_file) then
+                if fs.exists(proto.file) and fs.exists(proto.protocol_file) then
                     print("\n" .. string.rep("-", 40))
-                    print("Running " .. proto.name .. " test...")
+                    printColored("Testing " .. proto.name, colors.yellow)
                     runProtocolTest(proto)
                     testsRun = testsRun + 1
                 end
             end
 
-            if testsRun == 0 then
-                printColored("\nNo tests available to run!", colors.yellow)
-                print("Use option 'C' to create missing test files first.")
-                print("\nPress any key to continue...")
-                os.pullEvent("key")
+            print("\n" .. string.rep("=", 40))
+            if testsRun > 0 then
+                printColored(string.format("Completed %d tests", testsRun), colors.green)
             else
-                print("\n" .. string.rep("=", 40))
-                printColored("Completed " .. testsRun .. " tests", colors.green)
-                print("\nPress any key to continue...")
-                os.pullEvent("key")
+                printColored("No tests were available to run", colors.yellow)
+                print("Use option 'C' to create test files first.")
             end
+            print("\nPress any key to continue...")
+            os.pullEvent("key")
 
         elseif choice == "c" then
-            -- Create missing test files
             printHeader("Creating Missing Test Files")
             local created = 0
 
@@ -587,20 +621,22 @@ local function showMainMenu()
                 if not fs.exists(proto.file) then
                     print("Creating " .. proto.file .. "...")
                     if createBasicTestFile(proto) then
-                        printColored("  Created", colors.green)
+                        printColored("  Success", colors.green)
                         created = created + 1
                     else
                         printColored("  Failed", colors.red)
                     end
+                else
+                    print(proto.file .. " already exists")
                 end
             end
 
+            print(string.rep("-", 40))
             if created > 0 then
-                printColored("\nCreated " .. created .. " test files", colors.green)
+                printColored(string.format("Created %d test files", created), colors.green)
             else
-                printColored("\nNo test files needed to be created", colors.yellow)
+                printColored("No test files needed creation", colors.yellow)
             end
-
             print("\nPress any key to continue...")
             os.pullEvent("key")
 
@@ -613,15 +649,16 @@ local function showMainMenu()
         elseif choice == "g" then
             if testClient then
                 printColored("Launching test client GUI...", colors.green)
-                print("Note: This will exit the current menu.")
+                print("This will exit the current menu.")
                 print("Continue? (y/n)")
+
                 local answer = read()
                 if answer:lower() == "y" then
                     shell.run("/tests/test_client.lua")
                 end
             else
                 printColored("Test client not available!", colors.red)
-                print("Use option 'L' to try loading test components.")
+                print("Try option 'L' to load test components first.")
                 print("\nPress any key to continue...")
                 os.pullEvent("key")
             end
@@ -630,7 +667,7 @@ local function showMainMenu()
             loadTestComponents()
 
         else
-            -- Try to parse as number for protocol selection
+            -- Try to parse as protocol number
             local num = tonumber(choice)
             if num and num >= 1 and num <= #PROTOCOLS then
                 runProtocolTest(PROTOCOLS[num])
@@ -642,42 +679,42 @@ local function showMainMenu()
     end
 end
 
--- Main program
+-- Main program entry point
 local function main()
-    -- Ensure test directory exists
-    ensureTestDirectory()
+    -- Initial setup
+    ensureDirectories()
 
-    -- Check for critical components
+    -- Check for critical requirements
     if not peripheral.find("modem") then
         printHeader("Critical Error")
-        printColored("\nNo modem found!", colors.red)
-        print("Network testing requires a modem.")
-        print("\nPlease attach a modem and try again.")
+        printColored("No modem found!", colors.red)
+        print("Network testing requires a modem peripheral.")
+        print("Please attach a modem and restart the test suite.")
         return
     end
 
-    -- Show welcome message
-    printHeader("Welcome to Network Protocol Test Suite")
+    -- Welcome screen
+    printHeader("ComputerCraft Network Protocol Test Suite")
     print()
-    print("This suite allows you to test various network")
-    print("protocols implemented in the CC Networking system.")
+    print("This test suite provides comprehensive testing")
+    print("for network protocols in your CC system.")
     print()
     print("Features:")
-    print("• Protocol testing with auto-generated test files")
-    print("• Test server management and control")
-    print("• Comprehensive network testing")
-    print("• Integration with Basalt GUI components")
-    print("• System status monitoring")
+    print("- Individual protocol testing")
+    print("- Automatic test file generation")
+    print("- Server management integration")
+    print("- System status monitoring")
+    print("- Comprehensive network testing")
     print()
-    printColored("Press any key to continue...", colors.cyan)
+    printColored("Press any key to start...", colors.cyan)
     os.pullEvent("key")
 
-    -- Try to load test components automatically
+    -- Load test components
     loadTestComponents()
 
-    -- Run main menu
+    -- Start main menu
     showMainMenu()
 end
 
--- Run the test suite
+-- Execute the program
 main()
