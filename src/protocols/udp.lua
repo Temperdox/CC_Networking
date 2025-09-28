@@ -3,6 +3,7 @@
 
 local udp = {}
 udp.version = "1.0.0"
+udp.running = false
 
 -- UDP Configuration
 udp.config = {
@@ -37,17 +38,23 @@ local function log(level, message, ...)
         local formatted = string.format("[%s] UDP %s: %s", timestamp, level, string.format(message, ...))
         print(formatted)
 
-        -- Also write to log file
-        local logFile = fs.open("/var/log/udp.log", "a")
-        if logFile then
-            logFile.writeLine(formatted)
-            logFile.close()
+        -- Also write to log file if directory exists
+        if fs.exists("/var/log") then
+            local logFile = fs.open("/var/log/udp.log", "a")
+            if logFile then
+                logFile.writeLine(formatted)
+                logFile.close()
+            end
         end
     end
 end
 
 -- UDP Packet structure
 local function createPacket(sourcePort, destPort, data)
+    if type(data) ~= "string" then
+        data = textutils.serialize(data)
+    end
+
     local packet = {
         protocol = "UDP",
         source_port = sourcePort,
@@ -84,7 +91,8 @@ function UDPSocket:new(port, options)
             packets_received = 0,
             bytes_sent = 0,
             bytes_received = 0
-        }
+        },
+        created_at = os.epoch("utc")
     }
 
     setmetatable(socket, self)
@@ -142,31 +150,41 @@ function UDPSocket:send(data, destIP, destPort)
     -- Create UDP packet
     local packet = createPacket(self.port, destPort, data)
 
+    -- Get source IP from global config or use localhost
+    local sourceIP = "127.0.0.1"
+    if _G.network_config and _G.network_config.ipv4 then
+        sourceIP = _G.network_config.ipv4
+    end
+
     -- Wrap in network layer (integrate with existing netd)
     local networkPacket = {
         protocol = "UDP",
-        source_ip = _G.network_config and _G.network_config.ip or "127.0.0.1",
+        source_ip = sourceIP,
         dest_ip = destIP,
         ttl = 64,
-        udp_packet = packet
+        udp_packet = packet,
+        timestamp = os.epoch("utc")
     }
 
-    -- Send via rednet or external API based on destination
+    -- Send via rednet
     local success = false
-    if udp.isLocalNetwork(destIP) then
-        -- Local delivery via rednet
-        rednet.broadcast(networkPacket, "UDP_PACKET")
-        success = true
-        log("DEBUG", "Sent UDP packet locally: %s:%d -> %s:%d (%d bytes)",
-                networkPacket.source_ip, self.port, destIP, destPort, #data)
-    else
-        -- External delivery would go through your router/gateway
-        if _G.network_gateway then
-            success = _G.network_gateway.forward(networkPacket)
+    if rednet.isOpen() then
+        -- Check if this is for a local computer
+        if destIP == "127.0.0.1" or destIP == sourceIP then
+            -- Local delivery - queue event directly
+            os.queueEvent("udp_packet_received", networkPacket)
+            success = true
         else
-            log("ERROR", "No gateway configured for external UDP traffic")
-            return false, "No route to host"
+            -- Broadcast for network delivery
+            rednet.broadcast(networkPacket, "UDP_PACKET")
+            success = true
         end
+
+        log("DEBUG", "Sent UDP packet: %s:%d -> %s:%d (%d bytes)",
+                sourceIP, self.port, destIP, destPort, #data)
+    else
+        log("ERROR", "Cannot send UDP packet - rednet not open")
+        return false, "Network not available"
     end
 
     if success then
@@ -202,30 +220,29 @@ end
 
 function UDPSocket:receive(timeout)
     timeout = timeout or udp.config.timeout
-    local timer = os.startTimer(timeout)
+    local startTime = os.epoch("utc")
+    local timeoutMs = timeout * 1000
 
     while true do
-        local event, p1, p2, p3 = os.pullEvent()
+        -- Check buffer first
+        if #self.receive_buffer > 0 then
+            local packet = table.remove(self.receive_buffer, 1)
+            self.statistics.packets_received = self.statistics.packets_received + 1
+            self.statistics.bytes_received = self.statistics.bytes_received + #packet.data
 
-        if event == "timer" and p1 == timer then
-            return nil, "Timeout"
-        elseif event == "udp_packet" then
-            os.cancelTimer(timer)
-
-            -- Check if packet is for this socket
-            if p1 == self.port then
-                local packet = p2
-
-                -- Update statistics
-                self.statistics.packets_received = self.statistics.packets_received + 1
-                self.statistics.bytes_received = self.statistics.bytes_received + #packet.data
-
-                return packet.data, {
-                    ip = packet.source_ip,
-                    port = packet.source_port
-                }
-            end
+            return packet.data, {
+                ip = packet.source_ip,
+                port = packet.source_port
+            }
         end
+
+        -- Check timeout
+        if (os.epoch("utc") - startTime) > timeoutMs then
+            return nil, "Timeout"
+        end
+
+        -- Brief sleep to prevent busy waiting
+        sleep(0.05)
     end
 end
 
@@ -240,22 +257,33 @@ function UDPSocket:setReceiveCallback(callback)
 end
 
 function UDPSocket:close()
-    udp.sockets[self.port] = nil
-    udp.port_registry[self.port] = nil
-    udp.stats.active_sockets = udp.stats.active_sockets - 1
+    if udp.sockets[self.port] then
+        udp.sockets[self.port] = nil
+        udp.port_registry[self.port] = nil
+        udp.stats.active_sockets = udp.stats.active_sockets - 1
 
-    log("INFO", "Closed UDP socket on port %d", self.port)
+        log("INFO", "Closed UDP socket on port %d", self.port)
 
-    -- Log final socket statistics
-    if udp.config.statistics_enabled then
-        log("INFO", "Socket statistics - Sent: %d packets (%d bytes), Received: %d packets (%d bytes)",
-                self.statistics.packets_sent, self.statistics.bytes_sent,
-                self.statistics.packets_received, self.statistics.bytes_received)
+        -- Log final socket statistics
+        if udp.config.statistics_enabled then
+            log("INFO", "Socket statistics - Sent: %d packets (%d bytes), Received: %d packets (%d bytes)",
+                    self.statistics.packets_sent, self.statistics.bytes_sent,
+                    self.statistics.packets_received, self.statistics.bytes_received)
+        end
     end
 end
 
 function UDPSocket:getStatistics()
-    return self.statistics
+    return {
+        packets_sent = self.statistics.packets_sent,
+        packets_received = self.statistics.packets_received,
+        bytes_sent = self.statistics.bytes_sent,
+        bytes_received = self.statistics.bytes_received,
+        port = self.port,
+        bound = self.bound,
+        buffer_size = #self.receive_buffer,
+        created_at = self.created_at
+    }
 end
 
 function UDPSocket:setOption(option, value)
@@ -312,10 +340,7 @@ function udp.isLocalNetwork(ip)
     -- Check against local network config
     if _G.network_config and _G.network_config.subnet then
         -- Simple subnet check (you can make this more sophisticated)
-        local subnet = _G.network_config.subnet
-        local mask_bits = tonumber(subnet:match("/(%d+)$")) or 24
-        -- Simplified check - you'd want proper CIDR matching here
-        return true  -- Placeholder
+        return true  -- For now, treat all as local in CC environment
     end
 
     return false
@@ -323,24 +348,32 @@ end
 
 -- UDP packet handler (integrate with netd)
 function udp.handleIncomingPacket(packet)
-    if packet.protocol ~= "UDP" then
+    if not packet or type(packet) ~= "table" then
         return false
     end
 
-    local udpPacket = packet.udp_packet
+    -- Handle both direct UDP packets and network-wrapped packets
+    local udpPacket
+    if packet.protocol == "UDP" and packet.udp_packet then
+        udpPacket = packet.udp_packet
+    elseif packet.protocol == "UDP" and packet.dest_port then
+        udpPacket = packet
+        packet = {
+            source_ip = packet.source_ip or "127.0.0.1",
+            dest_ip = packet.dest_ip or "127.0.0.1"
+        }
+    else
+        return false
+    end
+
     local targetPort = udpPacket.dest_port
 
     -- Find socket listening on this port
     local socket = udp.sockets[targetPort]
     if socket then
-        -- Verify checksum (optional)
-        if udp.config.verify_checksum then
-            -- Checksum verification code here
-        end
-
         -- Update global statistics
         udp.stats.packets_received = udp.stats.packets_received + 1
-        udp.stats.bytes_received = udp.stats.bytes_received + #udpPacket.data
+        udp.stats.bytes_received = udp.stats.bytes_received + #(udpPacket.data or "")
 
         -- Add to socket's receive buffer
         if #socket.receive_buffer < udp.config.buffer_size then
@@ -359,8 +392,8 @@ function udp.handleIncomingPacket(packet)
                 })
             end
 
-            -- Queue event for blocking receive
-            os.queueEvent("udp_packet", targetPort, udpPacket)
+            log("DEBUG", "Received UDP packet on port %d from %s:%d",
+                    targetPort, packet.source_ip, udpPacket.source_port)
         else
             udp.stats.packets_dropped = udp.stats.packets_dropped + 1
             log("WARN", "Dropped UDP packet - buffer full on port %d", targetPort)
@@ -371,8 +404,6 @@ function udp.handleIncomingPacket(packet)
         -- Port unreachable
         udp.stats.packets_dropped = udp.stats.packets_dropped + 1
         log("DEBUG", "UDP packet to unreachable port %d", targetPort)
-
-        -- Could send ICMP port unreachable here
         return false
     end
 end
@@ -409,44 +440,75 @@ end
 
 -- Service management
 function udp.start()
-    -- Register with netd if available
-    if _G.netd then
-        _G.netd.registerProtocolHandler("UDP", udp.handleIncomingPacket)
-        log("INFO", "Registered UDP handler with netd")
+    if udp.running then
+        return true
     end
 
-    -- Start rednet listener
-    rednet.open(peripheral.find("modem") or error("No modem found"))
+    -- Ensure log directory exists
+    if not fs.exists("/var/log") then
+        fs.makeDir("/var/log")
+    end
 
-    -- Background packet processor
-    parallel.waitForAny(
-            function()
-                while true do
-                    local _, message, protocol = rednet.receive("UDP_PACKET")
-                    if message and message.protocol == "UDP" then
-                        udp.handleIncomingPacket(message)
-                    end
-                end
-            end
-    )
+    udp.running = true
+    log("INFO", "UDP service started")
+
+    return true
 end
 
 function udp.stop()
-    -- Close all sockets
-    for port, socket in pairs(udp.sockets) do
-        socket:close()
+    if not udp.running then
+        return
     end
 
-    log("INFO", "UDP service stopped")
+    udp.running = false
+
+    -- Close all sockets
+    local closedCount = 0
+    for port, socket in pairs(udp.sockets) do
+        socket:close()
+        closedCount = closedCount + 1
+    end
+
+    log("INFO", "UDP service stopped (closed %d sockets)", closedCount)
+end
+
+function udp.isRunning()
+    return udp.running
+end
+
+-- Simple broadcast function for network discovery
+function udp.broadcast(data, port)
+    port = port or 12345
+    local socket = udp.socket()
+
+    -- Broadcast to common local network ranges
+    local broadcasts = {"255.255.255.255", "192.168.1.255", "10.255.255.255"}
+    local success = false
+
+    for _, addr in ipairs(broadcasts) do
+        if socket:send(data, addr, port) then
+            success = true
+        end
+    end
+
+    socket:close()
+    return success
 end
 
 -- Testing utilities
 function udp.test()
     print("Starting UDP protocol test...")
 
+    -- Start the service
+    udp.start()
+
     -- Create server socket
     local server = udp.socket(12345)
-    server:bind(12345)
+    local success, err = server:bind(12345)
+    if not success then
+        print("Failed to bind server: " .. err)
+        return false
+    end
     print("Server listening on port 12345")
 
     -- Create client socket
@@ -455,15 +517,18 @@ function udp.test()
 
     -- Send test packet
     local testData = "Hello, UDP World!"
-    client:send(testData, "127.0.0.1", 12345)
-    print("Client sent: " .. testData)
+    success = client:send(testData, "127.0.0.1", 12345)
+    print("Client sent: " .. testData .. " (success: " .. tostring(success) .. ")")
+
+    -- Small delay to allow packet processing
+    sleep(0.1)
 
     -- Receive on server
     local data, sender = server:receive(2)
     if data then
         print("Server received: " .. data .. " from " .. sender.ip .. ":" .. sender.port)
     else
-        print("Server receive timeout")
+        print("Server receive timeout or error: " .. tostring(sender))
     end
 
     -- Print statistics
@@ -471,6 +536,7 @@ function udp.test()
     print("\nUDP Statistics:")
     print("  Packets sent: " .. stats.packets_sent)
     print("  Packets received: " .. stats.packets_received)
+    print("  Packets dropped: " .. stats.packets_dropped)
     print("  Active sockets: " .. stats.active_sockets)
 
     -- Cleanup
@@ -478,6 +544,7 @@ function udp.test()
     server:close()
 
     print("UDP protocol test completed!")
+    return true
 end
 
 -- Initialize
