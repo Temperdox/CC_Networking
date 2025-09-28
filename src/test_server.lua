@@ -22,6 +22,7 @@ end
 
 local function logInfo(msg) writeLog(msg, "INFO") end
 local function logSuccess(msg) writeLog(msg, "SUCCESS") end
+local function logWarning(msg) writeLog(msg, "WARNING") end
 local function logError(msg) writeLog(msg, "ERROR") end
 
 -- Simple HTTP server using rednet (for testing when network lib isn't available)
